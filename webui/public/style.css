@@ -342,6 +342,23 @@ select.input { width: auto; min-width: 80px; }
 .account-item .acct-sub { font-size: 12px; color: var(--dim); }
 .account-item .idx { color: var(--magenta); margin-right: 8px; }
 
+/* ───────────── 账号管理密码锁 ───────────── */
+
+.lock-box {
+  border: 1px dashed var(--border-light);
+  border-radius: 10px;
+  padding: 28px 20px;
+  text-align: center;
+  background: var(--bg-inset);
+}
+.lock-icon { font-size: 26px; margin-bottom: 10px; }
+.lock-box .row { justify-content: center; }
+.lock-box .input { width: 260px; }
+.lock-row { margin-top: 14px; }
+
+#accounts-lock-msg { min-height: 20px; }
+#accounts-lock-msg.err { color: var(--red); }
+
 /* ───────────── 其他 ───────────── */
 
 .footer {

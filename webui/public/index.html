@@ -95,9 +95,32 @@
     <!-- 账号管理 -->
     <section id="panel-accounts" class="panel">
       <div class="panel-head"><span class="comment">// 账号管理</span><span class="dim"> — 数据文件 data/userinfo.json</span></div>
-      <div id="account-list">
-        <div class="empty dim">// 加载中…</div>
+
+      <!-- 独立密码锁 -->
+      <div id="accounts-lock" hidden>
+        <div class="lock-box">
+          <div class="lock-icon">🔒</div>
+          <div class="row">
+            <span class="prompt-mark">$</span>
+            <input id="accounts-pwd" class="input" type="password" placeholder="输入账号管理密码" autocomplete="off" />
+          </div>
+          <div class="row">
+            <button id="btn-accounts-unlock" class="btn primary">[ 解 锁 ]</button>
+            <span id="accounts-lock-msg" class="dim"></span>
+          </div>
+          <p class="tip">此模块受独立密码保护（ACCOUNTS_PASSWORD），连续 3 次密码错误将锁定 5 分钟</p>
+        </div>
       </div>
+
+      <div id="accounts-content" hidden>
+        <div id="account-list">
+          <div class="empty dim">// 加载中…</div>
+        </div>
+        <div class="row lock-row">
+          <button id="btn-accounts-lock" class="btn ghost">[ 重新锁定 ]</button>
+        </div>
+      </div>
+
       <p class="tip">⚠ userid 与 token 已脱敏显示；删除账号不影响酷狗 APP 登录状态</p>
     </section>
   </main>

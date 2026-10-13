@@ -28,11 +28,12 @@ services:
     # WebUI + 内置定时调度一体化入口
     command: node webui/server.js
     ports:
-      - "3000:3000"                    # WebUI 控制台，按需改为 "8080:3000" 等
+      - "14725:3000"                    # WebUI 控制台，按需改为 "8080:3000" 等
     environment:
       # ── WebUI ──
       WEBUI_PORT: "3000"
       WEBUI_PASSWORD: ${WEBUI_PASSWORD:-}   # 可选访问密码，在 .env 中设置；公网暴露时强烈建议启用
+      ACCOUNTS_PASSWORD: ${ACCOUNTS_PASSWORD:-}   # 账号管理模块独立密码；连续 3 次错误锁定 5 分钟
       # ── 调度 ──
       # 注意：签到的日期/星期计算与容器时区无关，统一按北京时间处理。
       CRON_SCHEDULE: "10 1 * * *"      # 每天北京时间 01:10 签到

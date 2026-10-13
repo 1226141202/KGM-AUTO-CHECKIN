@@ -10,6 +10,8 @@
  * 环境变量：
  *   WEBUI_PORT        Web 控制台监听端口（默认 3000）
  *   WEBUI_PASSWORD    可选访问密码；设置后所有 /api/* 需携带 X-WebUI-Key 头（或 ?key= 查询参数，供 SSE 使用）
+ *   ACCOUNTS_PASSWORD 账号管理模块独立密码；设置后查看/删除账号需额外输入此密码，
+ *                     连续 ACCOUNTS_MAX_ATTEMPTS（默认 3）次错误将按来源 IP 锁定 ACCOUNTS_LOCK_MINUTES（默认 5）分钟
  *   WEBUI_API_PORT    登录用 API 服务端口（默认 3010）
  *   CHECKIN_API_PORT  签到子进程 API 服务端口（默认 3020）
  *   CRON_SCHEDULE     签到计划任务（默认 "10 1 * * *"，每天北京时间 01:10）
@@ -20,6 +22,7 @@
 
 import express from 'express'
 import cron from 'node-cron'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -41,6 +44,10 @@ const ROOT = path.resolve(__dirname, '..')
 
 const WEBUI_PORT = Number(process.env.WEBUI_PORT || 3000)
 const WEBUI_PASSWORD = String(process.env.WEBUI_PASSWORD || '').trim()
+const ACCOUNTS_PASSWORD = String(process.env.ACCOUNTS_PASSWORD || '').trim()
+const ACCOUNTS_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.ACCOUNTS_MAX_ATTEMPTS || '3', 10))
+const ACCOUNTS_LOCK_MINUTES = Math.max(0.01, parseFloat(process.env.ACCOUNTS_LOCK_MINUTES || '5'))
+const ACCOUNTS_LOCK_MS = ACCOUNTS_LOCK_MINUTES * 60 * 1000
 const WEBUI_API_PORT = process.env.WEBUI_API_PORT || '3010'
 const CHECKIN_API_PORT = process.env.CHECKIN_API_PORT || '3020'
 const SCHEDULE = process.env.CRON_SCHEDULE || '10 1 * * *'
@@ -267,13 +274,91 @@ app.disable('x-powered-by')
 app.use(express.json())
 app.use(express.static(path.join(__dirname, 'public')))
 
+/** 计时安全的字符串比较（先散列到等长，避免时序侧信道） */
+function safeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a ?? '')).digest()
+  const hb = crypto.createHash('sha256').update(String(b ?? '')).digest()
+  return crypto.timingSafeEqual(ha, hb)
+}
+
 // 可选访问密码：/api/* 需要 X-WebUI-Key 头（SSE 可用 ?key= 查询参数）
 app.use('/api', (req, res, next) => {
   if (!WEBUI_PASSWORD) return next()
   const key = req.headers['x-webui-key'] || req.query.key
-  if (key === WEBUI_PASSWORD) return next()
-  return res.status(401).json({ error: '未授权：请在页面右上角输入访问密码' })
+  if (safeEqual(key, WEBUI_PASSWORD)) return next()
+  return res.status(401).json({ error: '未授权：请在页面右上角输入访问密码', code: 'webui-auth' })
 })
+
+// ── 账号管理模块独立密码锁（防爆破）──
+// 与全局访问密码相互独立；按来源 IP 记录失败次数，连续错误达到上限后锁定一段时间。
+const accountsFails = new Map() // ip -> { fails, lockUntil }
+
+function accountsState(ip) {
+  let st = accountsFails.get(ip)
+  if (!st) {
+    st = { fails: 0, lockUntil: 0 }
+    accountsFails.set(ip, st)
+  }
+  if (accountsFails.size > 1000) {
+    const now = Date.now()
+    for (const [k, v] of accountsFails) {
+      if (v.lockUntil < now && v.fails === 0) accountsFails.delete(k)
+    }
+  }
+  return st
+}
+
+/** 提取请求中提供的账号管理密码（头 / 查询参数 / JSON body） */
+function providedAccountsKey(req) {
+  const v = req.headers['x-accounts-key'] ?? req.query.key ?? req.body?.password
+  return v == null ? '' : String(v)
+}
+
+function accountsGuard(req, res, next) {
+  if (!ACCOUNTS_PASSWORD) return next()
+  const st = accountsState(req.ip)
+  const now = Date.now()
+
+  // 锁定期间一律拒绝（即使密码正确，防止绕过冷却继续尝试）
+  if (st.lockUntil > now) {
+    return res.status(423).json({
+      error: `账号管理已锁定，请 ${Math.ceil((st.lockUntil - now) / 1000)} 秒后再试`,
+      code: 'accounts-auth',
+      retryAfter: Math.ceil((st.lockUntil - now) / 1000),
+    })
+  }
+
+  const provided = providedAccountsKey(req)
+  // 未提供密码不算失败：前端打开面板即会先请求，此处只提示需要密码
+  if (!provided) {
+    return res.status(401).json({ error: '账号管理已锁定，请输入密码', code: 'accounts-auth', needPassword: true })
+  }
+
+  if (safeEqual(provided, ACCOUNTS_PASSWORD)) {
+    st.fails = 0
+    return next()
+  }
+
+  st.fails++
+  if (st.fails >= ACCOUNTS_MAX_ATTEMPTS) {
+    st.lockUntil = now + ACCOUNTS_LOCK_MS
+    st.fails = 0
+    printRed(`[webui] 账号管理：${req.ip} 连续 ${ACCOUNTS_MAX_ATTEMPTS} 次密码错误，锁定 ${ACCOUNTS_LOCK_MINUTES} 分钟`)
+    return res.status(423).json({
+      error: `密码错误次数过多，账号管理已锁定 ${ACCOUNTS_LOCK_MINUTES} 分钟`,
+      code: 'accounts-auth',
+      retryAfter: Math.ceil(ACCOUNTS_LOCK_MS / 1000),
+    })
+  }
+  printYellow(`[webui] 账号管理：${req.ip} 密码错误（第 ${st.fails}/${ACCOUNTS_MAX_ATTEMPTS} 次）`)
+  return res.status(401).json({
+    error: `账号管理密码错误，剩余尝试次数 ${ACCOUNTS_MAX_ATTEMPTS - st.fails}`,
+    code: 'accounts-auth',
+    attemptsLeft: ACCOUNTS_MAX_ATTEMPTS - st.fails,
+  })
+}
+
+app.use('/api/accounts', accountsGuard)
 
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
 
@@ -300,11 +385,9 @@ app.get('/api/status', wrap(async (req, res) => {
       running: checkinState.running,
       lastRun: checkinState.lastRun,
     },
-    accounts: readUserinfo().map((u, i) => ({
-      index: i,
-      userid: maskIdentifier(u.userid),
-      tokenLength: String(u.token || '').length,
-    })),
+    // 只暴露账号数量；账号明细走受独立密码保护的 GET /api/accounts
+    accountCount: readUserinfo().length,
+    accountsLockEnabled: Boolean(ACCOUNTS_PASSWORD),
     apiServiceRunning: loginApi.running(),
   })
 }))
@@ -440,7 +523,24 @@ app.get('/api/checkin/logs', (req, res) => {
   })
 })
 
-// ── 账号管理 ──
+// ── 账号管理（受 accountsGuard 独立密码锁保护）──
+
+/** 验证独立密码（解锁面板用）；失败计数与锁定由 accountsGuard 统一处理 */
+app.post('/api/accounts/unlock', wrap(async (req, res) => {
+  res.json({ ok: true })
+}))
+
+app.get('/api/accounts', wrap(async (req, res) => {
+  res.json({
+    accounts: readUserinfo().map((u, i) => ({
+      index: i,
+      userid: maskIdentifier(u.userid),
+      tokenLength: String(u.token || '').length,
+    })),
+    lockEnabled: Boolean(ACCOUNTS_PASSWORD),
+  })
+}))
+
 app.delete('/api/accounts/:index', wrap(async (req, res) => {
   const index = parseInt(req.params.index, 10)
   const arr = readUserinfo()
@@ -479,6 +579,7 @@ app.listen(WEBUI_PORT, () => {
   printYellow(`  下次执行: ${nextRuns(1)[0] || '-'}`)
   printYellow(`  凭据文件: ${USERINFO_FILE}（${readUserinfo().length} 个账号）`)
   printYellow(`  访问密码: ${WEBUI_PASSWORD ? '已启用' : '未启用（仅建议在可信内网使用）'}`)
+  printYellow(`  账号管理锁: ${ACCOUNTS_PASSWORD ? `已启用（${ACCOUNTS_MAX_ATTEMPTS} 次错误锁定 ${Math.round(ACCOUNTS_LOCK_MINUTES)} 分钟）` : '未启用（设置 ACCOUNTS_PASSWORD 开启）'}`)
 
   if (cron.validate(SCHEDULE)) {
     cron.schedule(SCHEDULE, () => {

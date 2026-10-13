@@ -73,9 +73,9 @@ docker compose logs -f        # 查看日志，Ctrl+C 退出（容器继续运�
 | **扫码登录** | 选择账号数量 → 生成二维码 → 酷狗音乐 APP 扫码确认，凭据自动保存；多账号并行轮询扫码状态 |
 | **手机号登录** | 输入手机号发送验证码（60s 冷却）→ 输入验证码一键登录 |
 | **一键签到** | 点击立即执行签到，实时彩色终端输出（与 Actions 运行日志一致），签到结束显示退出码 |
-| **账号管理** | 查看/删除已登录账号（userid 脱敏显示），展示定时任务与下次执行时间 |
+| **账号管理** | 查看/删除已登录账号（userid 脱敏显示），展示定时任务与下次执行时间；支持**独立密码锁**：设置 `ACCOUNTS_PASSWORD` 后需输入该密码才能查看/操作，连续 3 次密码错误锁定 5 分钟（防爆破） |
 
-> - 公网暴露时，请在 `.env` 中设置 `WEBUI_PASSWORD`（参考 `.env.example`）开启访问密码
+> - 公网暴露时，请在 `.env` 中设置 `WEBUI_PASSWORD`（全局访问密码）与 `ACCOUNTS_PASSWORD`（账号管理独立密码），参考 `.env.example`
 > - 通知渠道密钥同样建议写在 `.env`（自动注入容器，不会被提交到仓库）
 
 ### 4. 命令行登录（可选）
@@ -124,6 +124,8 @@ docker compose run --rm kgcheckin node scheduler.js once   # 或命令行方式�
 |------|--------|------|
 | `WEBUI_PORT` | `3000` | WebUI 控制台监听端口 |
 | `WEBUI_PASSWORD` | - | 可选访问密码；设置后所有 API 需携带密钥（公网暴露时建议设置，写在 `.env` 中） |
+| `ACCOUNTS_PASSWORD` | - | 账号管理模块独立密码；设置后查看/删除账号需额外输入，连续 3 次错误锁定 5 分钟 |
+| `ACCOUNTS_MAX_ATTEMPTS` / `ACCOUNTS_LOCK_MINUTES` | `3` / `5` | 可选覆盖防爆破策略（最大错误次数 / 锁定时长） |
 | `CRON_SCHEDULE` | `10 1 * * *` | 签到计划任务（cron 表达式），默认每天北京时间 01:10 |
 | `CRON_TIMEZONE` | `Asia/Shanghai` | 调度器使用的时区 |
 | `RUN_ON_STARTUP` | `false` | 设为 `true` 时容器启动后立即执行一次签到 |

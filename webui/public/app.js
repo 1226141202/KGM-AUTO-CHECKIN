@@ -44,17 +44,26 @@ async function submitAuth() {
   }
 }
 
+let ACCOUNTS_KEY = sessionStorage.getItem('kc_accts') || ''
+
 async function api(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) }
   if (AUTH) headers['X-WebUI-Key'] = AUTH
+  if (ACCOUNTS_KEY) headers['X-Accounts-Key'] = ACCOUNTS_KEY
   const res = await fetch(path, { ...opts, headers })
-  if (res.status === 401) {
-    const granted = await askAuth()
-    if (granted) return api(path, opts)
-    throw new Error('需要访问密码')
-  }
   const data = await res.json().catch(() => ({}))
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+  if (!res.ok) {
+    // 全局访问密码未通过：弹窗后重试。
+    // 账号管理模块的 401（code=accounts-auth）不走这里，由对应面板自行展示锁屏/倒计时
+    if (res.status === 401 && data.code === 'webui-auth') {
+      const granted = await askAuth()
+      if (granted) return api(path, opts)
+    }
+    const err = new Error(data.error || `HTTP ${res.status}`)
+    err.status = res.status
+    err.data = data
+    throw err
+  }
   return data
 }
 
@@ -97,7 +106,7 @@ async function refreshStatus() {
   }
   lastStatus = s
 
-  const n = s.accounts.length
+  const n = s.accountCount
   setChip('#chip-cred', `▮ 凭据: ${n > 0 ? `${n} 个账号` : '未配置'}`, n > 0 ? 'ok' : 'warn')
 
   const sched = s.schedule
@@ -120,42 +129,132 @@ async function refreshStatus() {
       : '// 空闲'
 }
 
-async function loadAccounts() {
+/* ────────────────── 账号管理（独立密码锁）────────────────── */
+
+let accountsTimer = null
+
+function showAccountsLock(msg, isErr) {
+  $('#accounts-lock').hidden = false
+  $('#accounts-content').hidden = true
+  const el = $('#accounts-lock-msg')
+  el.textContent = msg || ''
+  el.className = isErr ? 'err' : 'dim'
+}
+
+function renderAccounts(accounts) {
   const box = $('#account-list')
-  try {
-    const s = await api('/api/status')
-    if (!s.accounts.length) {
-      box.innerHTML = '<div class="empty dim">// 暂无账号，请先在「扫码登录」或「手机号登录」中添加</div>'
+  $('#accounts-lock').hidden = true
+  $('#accounts-content').hidden = false
+  if (!accounts.length) {
+    box.innerHTML = '<div class="empty dim">// 暂无账号，请先在「扫码登录」或「手机号登录」中添加</div>'
+    return
+  }
+  box.innerHTML = ''
+  accounts.forEach(acct => {
+    const div = document.createElement('div')
+    div.className = 'account-item'
+    div.innerHTML = `
+      <div class="acct-main">
+        <div class="acct-id"><span class="idx">[${acct.index}]</span>userid: ${acct.userid}</div>
+        <div class="acct-sub">token: ****（${acct.tokenLength} 字符）· 每周日签到时自动刷新</div>
+      </div>`
+    const btn = document.createElement('button')
+    btn.className = 'btn danger-ghost'
+    btn.textContent = '[ 删除 ]'
+    btn.addEventListener('click', async () => {
+      if (!confirm(`确认删除账号 ${acct.userid}？`)) return
+      try {
+        await api(`/api/accounts/${acct.index}`, { method: 'DELETE' })
+        toast('账号已删除', 'ok')
+        loadAccounts()
+        refreshStatus()
+      } catch (e) {
+        if (e.status === 423) lockdownAccounts(e.data && e.data.retryAfter, e.message)
+        else toast(e.message, 'err')
+      }
+    })
+    div.appendChild(btn)
+    box.appendChild(div)
+  })
+}
+
+/** 锁定倒计时：禁用输入与按钮，结束自动恢复 */
+function lockdownAccounts(seconds, msg) {
+  const input = $('#accounts-pwd')
+  const btn = $('#btn-accounts-unlock')
+  showAccountsLock(msg || '', true)
+  input.disabled = true
+  btn.disabled = true
+  clearInterval(accountsTimer)
+  let remain = Math.max(1, parseInt(seconds, 10) || 300)
+  const tick = () => {
+    if (remain <= 0) {
+      clearInterval(accountsTimer)
+      input.disabled = false
+      btn.disabled = false
+      $('#accounts-lock-msg').textContent = '// 锁定已解除，请输入密码'
+      $('#accounts-lock-msg').className = 'dim'
       return
     }
-    box.innerHTML = ''
-    s.accounts.forEach(acct => {
-      const div = document.createElement('div')
-      div.className = 'account-item'
-      div.innerHTML = `
-        <div class="acct-main">
-          <div class="acct-id"><span class="idx">[${acct.index}]</span>userid: ${acct.userid}</div>
-          <div class="acct-sub">token: ****（${acct.tokenLength} 字符）· 每周日签到时自动刷新</div>
-        </div>`
-      const btn = document.createElement('button')
-      btn.className = 'btn danger-ghost'
-      btn.textContent = '[ 删除 ]'
-      btn.addEventListener('click', async () => {
-        if (!confirm(`确认删除账号 ${acct.userid}？`)) return
-        try {
-          await api(`/api/accounts/${acct.index}`, { method: 'DELETE' })
-          toast('账号已删除', 'ok')
-          loadAccounts()
-          refreshStatus()
-        } catch (e) { toast(e.message, 'err') }
-      })
-      div.appendChild(btn)
-      box.appendChild(div)
-    })
+    const mm = String(Math.floor(remain / 60)).padStart(2, '0')
+    const ss = String(remain % 60).padStart(2, '0')
+    $('#accounts-lock-msg').textContent = `⏳ ${msg ? msg + ' · ' : ''}剩余 ${mm}:${ss}`
+    remain--
+  }
+  tick()
+  accountsTimer = setInterval(tick, 1000)
+}
+
+async function loadAccounts() {
+  clearInterval(accountsTimer)
+  try {
+    const r = await api('/api/accounts')
+    $('#btn-accounts-lock').hidden = !r.lockEnabled
+    renderAccounts(r.accounts)
   } catch (e) {
-    box.innerHTML = `<div class="empty dim">// 加载失败：${e.message}</div>`
+    if (e.status === 423) {
+      lockdownAccounts(e.data && e.data.retryAfter, e.message)
+      return
+    }
+    // 401：需要输入独立密码（未提供密码不计失败次数）
+    showAccountsLock(e.status === 401 ? '' : `// 加载失败：${e.message}`, e.status !== 401)
   }
 }
+
+async function tryUnlock() {
+  const input = $('#accounts-pwd')
+  const btn = $('#btn-accounts-unlock')
+  if (input.disabled) return
+  const pwd = input.value.trim()
+  if (!pwd) {
+    showAccountsLock('// 请输入密码', true)
+    return
+  }
+  btn.disabled = true
+  try {
+    await api('/api/accounts/unlock', { method: 'POST', body: JSON.stringify({ password: pwd }) })
+    ACCOUNTS_KEY = pwd
+    sessionStorage.setItem('kc_accts', pwd)
+    input.value = ''
+    await loadAccounts()
+  } catch (e) {
+    if (e.status === 423) {
+      lockdownAccounts(e.data && e.data.retryAfter, e.message)
+      return
+    }
+    showAccountsLock(`// ${e.message}`, true)
+    btn.disabled = false
+  }
+}
+
+$('#btn-accounts-unlock').addEventListener('click', tryUnlock)
+$('#accounts-pwd').addEventListener('keydown', e => { if (e.key === 'Enter') tryUnlock() })
+
+$('#btn-accounts-lock').addEventListener('click', () => {
+  ACCOUNTS_KEY = ''
+  sessionStorage.removeItem('kc_accts')
+  showAccountsLock('')
+})
 
 /* ────────────────── 扫码登录 ────────────────── */
 

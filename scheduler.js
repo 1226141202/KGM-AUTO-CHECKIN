@@ -29,11 +29,13 @@ function nowStr() {
   }).format(new Date()).replaceAll('/', '-')
 }
 
-/** 执行一次签到（node main.js），返回退出码 */
-function runCheckin() {
+/** 执行一次签到（node main.js），返回退出码；skipDone=手动触发跳过当日已签到账号 */
+function runCheckin(skipDone = false) {
   return new Promise(resolve => {
     printMagenta(`[${nowStr()}] ──────────── 开始执行签到任务 ────────────`)
-    const child = spawn(process.execPath, ['main.js'], { stdio: 'inherit' })
+    const env = { ...process.env }
+    if (skipDone) env.CHECKIN_SKIP_DONE = '1'
+    const child = spawn(process.execPath, ['main.js'], { stdio: 'inherit', env })
     child.on('error', err => {
       printRed(`[${nowStr()}] 签到进程启动失败：${err.message}`)
       resolve(1)
@@ -82,7 +84,7 @@ function printUpcoming(n = 3) {
 const mode = process.argv[2] || 'daemon'
 
 if (mode === 'once') {
-  runCheckin().then(code => process.exit(code))
+  runCheckin(true).then(code => process.exit(code))
 } else if (mode === 'next') {
   printUpcoming()
 } else {

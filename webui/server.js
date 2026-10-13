@@ -199,6 +199,10 @@ function startCheckin(trigger = 'manual') {
   broadcast('start', checkinState.lastRun)
 
   const env = { ...process.env, API_PORT: CHECKIN_API_PORT }
+  // 手动触发时跳过当日已完成签到的账号（定时/启动触发不设置，保持完整执行）
+  if (trigger === 'manual') {
+    env.CHECKIN_SKIP_DONE = '1'
+  }
   const userinfoRaw = readUserinfoRaw()
   if (userinfoRaw) {
     env.USERINFO = userinfoRaw

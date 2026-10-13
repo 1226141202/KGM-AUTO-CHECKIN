@@ -5,6 +5,7 @@ import { sendNotify } from "./utils/notify.js";
 import { close_api, delay, send, startService, waitForApi } from "./utils/utils.js";
 import { writeUserinfoFile, parseUserinfoJson } from "./utils/userinfo.js";
 import { beijingDateStr, isBeijingSunday } from "./utils/date.js";
+import { checkinStateEnabled, loadDoneToday, saveDoneToday } from "./utils/checkinState.js";
 
 async function main() {
 
@@ -28,6 +29,13 @@ async function main() {
   const now = new Date()
   const date = beijingDateStr(now)
 
+  // 手动触发（WebUI「立即签到」/ scheduler.js once）时跳过当日已完成签到的账号；
+  // 定时任务与 GitHub Actions 不设置该标记，保持完整执行。
+  const skipDone = ['1', 'true', 'yes', 'on'].includes(String(process.env.CHECKIN_SKIP_DONE || '').trim().toLowerCase())
+  const stateEnabled = checkinStateEnabled(skipDone)
+  const doneSet = stateEnabled ? loadDoneToday(date) : new Set()
+  let skippedCount = 0
+
   const errorMsg = {}
   // 通知结果收集
   const notifyResults = []
@@ -35,9 +43,27 @@ async function main() {
 
   try {
     for (const user of userinfo) {
+      // 手动触发：当日已完成签到（无任何错误）的账号直接跳过，不再请求酷狗 API
+      if (skipDone && doneSet.has(String(user.userid))) {
+        const safeUserId = maskIdentifier(user.userid)
+        printYellow(`账号 ${safeUserId} 今日已签到，跳过`)
+        notifyResults.push({
+          nickname: safeUserId,
+          status: '跳过',
+          listen: '今日已签到',
+          vipClaim: '-',
+          vipExpiry: '-',
+          error: ''
+        })
+        skippedCount++
+        continue
+      }
+
       // 单账号异常隔离：任何一个账号的请求/解析出错，只记录该账号失败，
       // 不影响其余账号继续执行，也保证后续通知与 secret 刷新一定能触发。
       try {
+        // 以进入账号时已有的错误数为基准，结束后对比即可知道该账号是否全程无错
+        const errCountBefore = Object.keys(errorMsg).length
         let headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
         const userDetail = await send(`/user/detail?timestrap=${Date.now()}`, "GET", headers)
         if (userDetail?.data?.nickname == null) {
@@ -137,6 +163,12 @@ async function main() {
           vipExpiry,
           error: ''
         })
+
+        // 全程无错（含"今日已领取"与"次数已用光"）即视为当日已完成签到，写入状态供手动触发跳过
+        const accountHadError = Object.keys(errorMsg).length > errCountBefore
+        if (!accountHadError && stateEnabled) {
+          doneSet.add(String(user.userid))
+        }
       } catch (err) {
         const safeUserId = maskIdentifier(user.userid || '未知')
         printRed(`账号 ${safeUserId} 处理异常：${err && err.message ? err.message : String(err)}`)
@@ -156,6 +188,13 @@ async function main() {
 
   } finally {
     close_api(api)
+  }
+
+  // 持久化当日已完成签到的账号（跨天自动失效），供手动触发时跳过
+  if (stateEnabled) {
+    if (saveDoneToday(date, doneSet)) {
+      printYellow(`今日已完成签到的账号已记录（${doneSet.size} 个），手动触发时将自动跳过`)
+    }
   }
 
   // 刷新后的凭据持久化：Docker 部署写入 USERINFO_FILE 文件（挂载卷），
@@ -185,16 +224,37 @@ async function main() {
   }
 
   // 构建通知内容（放在 secret 更新之后、错误抛出之前，确保始终执行）
+  const skipCount = notifyResults.filter(r => r.status === '跳过').length
+  const allSkipped = skippedCount > 0 && skippedCount === notifyResults.length
+
+  // 手动触发且全部账号均已签到：不重复发送通知，避免冗余打扰
+  if (allSkipped) {
+    printGreen(`当日（${date}）所有账号均已签到，本次共跳过 ${skipCount} 个账号，无需发送通知`)
+    if (Object.keys(errorMsg).length > 0) {
+      printRed("异常信息如下:")
+      console.dir(sanitizeForLog(errorMsg), { depth: null })
+      throw new Error("领取异常")
+    }
+    if (secretError) {
+      throw secretError
+    }
+    return
+  }
+
   const title = `酷狗签到${hasError ? '异常' : '成功'} ${date}`
   let content = `📅 日期: ${date}\n`
   content += `📊 账号数: ${notifyResults.length}\n`
   const successCount = notifyResults.filter(r => r.status === '成功').length
-  const failCount = notifyResults.length - successCount
-  content += `✅ 成功: ${successCount}  ❌ 失败: ${failCount}\n`
+  const failCount = notifyResults.length - successCount - skipCount
+  content += `✅ 成功: ${successCount}  ⏭ 跳过: ${skipCount}  ❌ 失败: ${failCount}\n`
 
   for (const r of notifyResults) {
     content += `\n【${r.nickname}】\n`
     content += `  🎵 听歌领取: ${r.listen}\n`
+    if (r.status === '跳过') {
+      content += `  ⏭ 当日已完成签到，本次跳过\n`
+      continue
+    }
     content += `  🎁 VIP领取: ${r.vipClaim} 次\n`
     content += `  ⏰ VIP到期: ${r.vipExpiry}\n`
     if (r.error) {

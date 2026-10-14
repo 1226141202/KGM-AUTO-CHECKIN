@@ -31,7 +31,7 @@ import { createRequire } from 'node:module'
 
 import { close_api, delay, send, startService, waitForApi } from '../utils/utils.js'
 import { upsertUser, writeUserinfoFile, parseUserinfoJson } from '../utils/userinfo.js'
-import { maskIdentifier } from '../utils/safeLog.js'
+import { maskIdentifier, summarizeResponse } from '../utils/safeLog.js'
 import { printGreen, printMagenta, printRed, printYellow } from '../utils/colorOut.js'
 
 const require = createRequire(import.meta.url)
@@ -469,6 +469,8 @@ app.post('/api/phone/send', wrap(async (req, res) => {
     throw err
   }
   printGreen(`[webui] 验证码已发送至 ${phone.slice(0, 2)}*******${phone.slice(-2)}`)
+  // 成功响应体也记录（脱敏后），便于短信未送达时诊断上游行为
+  printYellow(`[webui] 发送响应: ${JSON.stringify(summarizeResponse(r))}`)
   res.json({ ok: true })
 }))
 

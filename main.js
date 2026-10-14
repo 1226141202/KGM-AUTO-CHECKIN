@@ -171,13 +171,21 @@ async function main() {
   }
 
   try {
-    // 并发数（账号级并行）：CHECKIN_CONCURRENCY，默认 3；设为 1 即逐个串行（与旧版行为一致）
-    const CONCURRENCY = Math.min(
-      Math.max(1, parseInt(process.env.CHECKIN_CONCURRENCY || '3', 10) || 3),
-      Math.max(1, userinfo.length)
-    )
+    // 并发数（账号级并行）：默认不限制——有几个账号就几路全部并行；
+    // CHECKIN_CONCURRENCY 可选限流：设 N = 最多 N 路，设 1 = 逐个串行（与旧版行为一致）
+    const rawConcurrency = String(process.env.CHECKIN_CONCURRENCY || '').trim().toLowerCase()
+    let CONCURRENCY
+    if (!rawConcurrency || rawConcurrency === 'max' || rawConcurrency === '0') {
+      CONCURRENCY = userinfo.length
+    } else {
+      const n = parseInt(rawConcurrency, 10)
+      CONCURRENCY = Math.min(Math.max(1, n || 1), Math.max(1, userinfo.length))
+    }
     if (userinfo.length > 1) {
-      printYellow(`多账号并行签到：${CONCURRENCY} 路（CHECKIN_CONCURRENCY，1 为逐个串行）`)
+      const source = (!rawConcurrency || rawConcurrency === 'max' || rawConcurrency === '0')
+        ? '全部账号同时并行'
+        : `限流 ${CONCURRENCY} 路（CHECKIN_CONCURRENCY，1 为逐个串行）`
+      printYellow(`多账号并行签到：${CONCURRENCY} 个账号同时进行（${source}）`)
     }
 
     // 工作池：CONCURRENCY 个 worker 从队列取账号执行；results 始终按账号原始顺序排列

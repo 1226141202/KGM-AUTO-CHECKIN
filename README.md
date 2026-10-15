@@ -10,6 +10,13 @@
 
 登录后即可使用，目前提供二维码登录(推荐)和手机号登录(一个手机号绑定多个账号无法登录，见 [多账号登录问题](https://github.com/MakcRe/KuGouMusicApi/issues/51))
 
+### 项目试用链接
+要删除账户信息请提issues 附带昵称与位于 我的-设置-账号和绑定设置-ID前三后二位
+
+```htlm
+https://kg.neteaseapi.cc.cd/
+```
+
 ## 免责声明
 
 > [!important]

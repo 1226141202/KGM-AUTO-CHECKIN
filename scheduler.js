@@ -13,6 +13,7 @@
 import cron from 'node-cron'
 import { spawn } from 'node:child_process'
 import { printGreen, printMagenta, printRed, printYellow } from './utils/colorOut.js'
+import { nextCronRuns } from './utils/date.js'
 
 const SCHEDULE = process.env.CRON_SCHEDULE || '10 1 * * *' // 每天北京时间 01:10，与 Actions 的签到 cron 保持一致
 const TIMEZONE = process.env.CRON_TIMEZONE || 'Asia/Shanghai'
@@ -53,30 +54,8 @@ function runCheckin(skipDone = false) {
 
 /** 打印接下来 n 次计划执行时间（用于校验 CRON_SCHEDULE 配置） */
 function printUpcoming(n = 3) {
-  // 仅支持 "分 时 * * *" 形式的精确预览，复杂表达式（含 */n、星期/日限定的）跳过
-  const fields = SCHEDULE.trim().split(/\s+/)
-  const [minute, hour] = fields
-  if (
-    fields.length !== 5 ||
-    !/^\d+$/.test(minute) || !/^\d+$/.test(hour) ||
-    fields.slice(2).some(f => f !== '*')
-  ) return
-
-  // 北京时间固定为 UTC+8（无夏令时），北京时间 hh:mm == UTC (hh-8):mm
-  const full = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: TIMEZONE, month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-  })
-  const now = new Date()
-  const list = []
-  for (let day = 0; list.length < n && day < 366; day++) {
-    const t = Date.UTC(
-      now.getUTCFullYear(), now.getUTCMonth(),
-      now.getUTCDate() + day, Number(hour) - 8, Number(minute)
-    )
-    if (t > now.getTime()) list.push(full.format(new Date(t)))
-  }
-  for (const t of list) printYellow(`  下一次执行（${TIMEZONE}）：${t}`)
+  const runs = nextCronRuns(SCHEDULE, TIMEZONE, n)
+  for (const t of runs) printYellow(`  下一次执行（${TIMEZONE}）：${t}`)
 }
 
 // ────────────────────────── 入口 ──────────────────────────

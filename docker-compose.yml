@@ -33,7 +33,7 @@ services:
       # ── WebUI ──
       WEBUI_PORT: "3000"
       WEBUI_PASSWORD: ${WEBUI_PASSWORD:-}   # 可选访问密码，在 .env 中设置；公网暴露时强烈建议启用
-      ACCOUNTS_PASSWORD: ${ACCOUNTS_PASSWORD:-}   # 账号管理模块独立密码；连续 3 次错误锁定 5 分钟
+      ACCOUNTS_PASSWORD: ${ACCOUNTS_PASSWORD:-}   # 账号管理 admin 管理员密码（普通账号默认密码=酷狗ID本身）；连续 3 次错误锁定 5 分钟
       # ── 酷狗设备标识（建议固定：频繁更换设备会被风控静默丢弃验证码短信；在 .env 中设置）──
       KUGOU_API_GUID: ${KUGOU_API_GUID:-}
       KUGOU_API_MID: ${KUGOU_API_MID:-}

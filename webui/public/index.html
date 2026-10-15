@@ -102,13 +102,17 @@
           <div class="lock-icon">🔒</div>
           <div class="row">
             <span class="prompt-mark">$</span>
-            <input id="accounts-pwd" class="input" type="password" placeholder="输入账号管理密码" autocomplete="off" />
+            <input id="accounts-id" class="input" type="text" placeholder="酷狗ID（admin 为管理员）" autocomplete="off" />
+          </div>
+          <div class="row">
+            <span class="prompt-mark">$</span>
+            <input id="accounts-pwd" class="input" type="password" placeholder="密码（默认为酷狗ID本身）" autocomplete="off" />
           </div>
           <div class="row">
             <button id="btn-accounts-unlock" class="btn primary">[ 解 锁 ]</button>
             <span id="accounts-lock-msg" class="dim"></span>
           </div>
-          <p class="tip">此模块受独立密码保护（ACCOUNTS_PASSWORD），连续 3 次密码错误将锁定 5 分钟</p>
+          <p class="tip">每个账号有独立密码（默认为酷狗ID本身），仅可查看/管理自己的账号；admin 可管理所有账号（密码为 ACCOUNTS_PASSWORD）。连续 3 次密码错误将锁定 5 分钟</p>
         </div>
       </div>
 
@@ -117,6 +121,8 @@
           <div class="empty dim">// 加载中…</div>
         </div>
         <div class="row lock-row">
+          <span id="accounts-who" class="dim"></span>
+          <button id="btn-accounts-passwd" class="btn ghost">[ 修改密码 ]</button>
           <button id="btn-accounts-lock" class="btn ghost">[ 重新锁定 ]</button>
         </div>
       </div>

@@ -45,11 +45,13 @@ async function submitAuth() {
 }
 
 let ACCOUNTS_KEY = sessionStorage.getItem('kc_accts') || ''
+let ACCOUNTS_ID = sessionStorage.getItem('kc_accts_id') || ''
 
 async function api(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) }
   if (AUTH) headers['X-WebUI-Key'] = AUTH
   if (ACCOUNTS_KEY) headers['X-Accounts-Key'] = ACCOUNTS_KEY
+  if (ACCOUNTS_ID) headers['X-Accounts-Id'] = ACCOUNTS_ID
   const res = await fetch(path, { ...opts, headers })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
@@ -141,10 +143,12 @@ function showAccountsLock(msg, isErr) {
   el.className = isErr ? 'err' : 'dim'
 }
 
-function renderAccounts(accounts) {
+function renderAccounts(accounts, admin) {
   const box = $('#account-list')
   $('#accounts-lock').hidden = true
   $('#accounts-content').hidden = false
+  $('#accounts-who').textContent = admin ? '// 当前身份：admin（管理员）' : `// 当前身份：${ACCOUNTS_ID}`
+  $('#btn-accounts-passwd').hidden = false
   if (!accounts.length) {
     box.innerHTML = '<div class="empty dim">// 暂无账号，请先在「扫码登录」或「手机号登录」中添加</div>'
     return
@@ -184,9 +188,11 @@ function renderAccounts(accounts) {
 
 /** 锁定倒计时：禁用输入与按钮，结束自动恢复 */
 function lockdownAccounts(seconds, msg) {
+  const idInput = $('#accounts-id')
   const input = $('#accounts-pwd')
   const btn = $('#btn-accounts-unlock')
   showAccountsLock(msg || '', true)
+  idInput.disabled = true
   input.disabled = true
   btn.disabled = true
   clearInterval(accountsTimer)
@@ -194,6 +200,7 @@ function lockdownAccounts(seconds, msg) {
   const tick = () => {
     if (remain <= 0) {
       clearInterval(accountsTimer)
+      idInput.disabled = false
       input.disabled = false
       btn.disabled = false
       $('#accounts-lock-msg').textContent = '// 锁定已解除，请输入密码'
@@ -213,31 +220,34 @@ async function loadAccounts() {
   clearInterval(accountsTimer)
   try {
     const r = await api('/api/accounts')
-    $('#btn-accounts-lock').hidden = !r.lockEnabled
-    renderAccounts(r.accounts)
+    renderAccounts(r.accounts, r.admin)
   } catch (e) {
     if (e.status === 423) {
       lockdownAccounts(e.data && e.data.retryAfter, e.message)
       return
     }
-    // 401：需要输入独立密码（未提供密码不计失败次数）
+    // 401：需要输入凭据（未提供凭据不计失败次数）
     showAccountsLock(e.status === 401 ? '' : `// 加载失败：${e.message}`, e.status !== 401)
   }
 }
 
 async function tryUnlock() {
+  const idInput = $('#accounts-id')
   const input = $('#accounts-pwd')
   const btn = $('#btn-accounts-unlock')
   if (input.disabled) return
+  const id = idInput.value.trim()
   const pwd = input.value.trim()
-  if (!pwd) {
-    showAccountsLock('// 请输入密码', true)
+  if (!id || !pwd) {
+    showAccountsLock('// 请输入酷狗ID和密码', true)
     return
   }
   btn.disabled = true
   try {
-    await api('/api/accounts/unlock', { method: 'POST', body: JSON.stringify({ password: pwd }) })
+    const r = await api('/api/accounts/unlock', { method: 'POST', body: JSON.stringify({ userid: id, password: pwd }) })
+    ACCOUNTS_ID = id
     ACCOUNTS_KEY = pwd
+    sessionStorage.setItem('kc_accts_id', id)
     sessionStorage.setItem('kc_accts', pwd)
     input.value = ''
     await loadAccounts()
@@ -253,11 +263,43 @@ async function tryUnlock() {
 
 $('#btn-accounts-unlock').addEventListener('click', tryUnlock)
 $('#accounts-pwd').addEventListener('keydown', e => { if (e.key === 'Enter') tryUnlock() })
+$('#accounts-id').addEventListener('keydown', e => { if (e.key === 'Enter') tryUnlock() })
 
 $('#btn-accounts-lock').addEventListener('click', () => {
   ACCOUNTS_KEY = ''
+  ACCOUNTS_ID = ''
   sessionStorage.removeItem('kc_accts')
+  sessionStorage.removeItem('kc_accts_id')
   showAccountsLock('')
+})
+
+/* ── 修改密码 ── */
+$('#btn-accounts-passwd').addEventListener('click', async () => {
+  const isAdmin = ACCOUNTS_ID === 'admin'
+  const targetUserid = isAdmin
+    ? prompt('输入要修改密码的账号酷狗ID（留空取消）：')
+    : ACCOUNTS_ID
+  if (!targetUserid) return
+  const newPassword = prompt(`为账号 ${targetUserid} 设置新密码（4-64 位）：`)
+  if (newPassword == null) return
+  if (newPassword.length < 4 || newPassword.length > 64) {
+    toast('新密码长度需为 4-64 位', 'err')
+    return
+  }
+  try {
+    await api('/api/accounts/password', {
+      method: 'POST',
+      body: JSON.stringify({ newPassword, ...(isAdmin ? { targetUserid } : {}) }),
+    })
+    toast('密码已更新', 'ok')
+    // 若修改的是自己的密码，更新本地凭据
+    if (!isAdmin) {
+      ACCOUNTS_KEY = newPassword
+      sessionStorage.setItem('kc_accts', newPassword)
+    }
+  } catch (e) {
+    toast(e.message, 'err')
+  }
 })
 
 /* ────────────────── 扫码登录 ────────────────── */

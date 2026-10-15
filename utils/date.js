@@ -41,4 +41,70 @@ function isBeijingSunday(d = new Date()) {
   return WEEKDAY_FORMATTER.format(d) === 'Sun'
 }
 
-export { beijingDateStr, isBeijingSunday }
+/**
+ * 计算指定 IANA 时区在某一时刻相对 UTC 的偏移量（毫秒）。
+ * 利用 Intl.DateTimeFormat 将 UTC 时刻格式化为目标时区的本地时间，
+ * 再按 UTC 重新解析，差值即为偏移量。正确处理夏令时。
+ */
+function timezoneOffsetMs(timeZone, date) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hourCycle: 'h23',
+  })
+  const map = {}
+  for (const p of dtf.formatToParts(date)) map[p.type] = p.value
+  const asUtc = Date.UTC(+map.year, +map.month - 1, +map.day, +map.hour, +map.minute, +map.second)
+  return asUtc - date.getTime()
+}
+
+/**
+ * 预览 "分 时 * * *" 形式的 cron 接下来 n 次执行时间（按指定时区）。
+ * 仅支持简单的 "M H * * *" 格式（每天固定时刻），复杂表达式返回空数组。
+ * 结果按格式化字符串返回（如 "10/16 01:10"），与调度器实际触发时刻一致。
+ *
+ * @param {string} schedule  cron 表达式（5 段式）
+ * @param {string} timeZone  IANA 时区名（如 "Asia/Shanghai"）
+ * @param {number} [n=3]     返回的未来执行次数
+ * @returns {string[]}       格式化后的执行时间列表
+ */
+function nextCronRuns(schedule, timeZone, n = 3) {
+  const fields = schedule.trim().split(/\s+/)
+  const [minute, hour] = fields
+  if (
+    fields.length !== 5 ||
+    !/^\d+$/.test(minute) || !/^\d+$/.test(hour) ||
+    fields.slice(2).some(f => f !== '*')
+  ) return []
+
+  const targetMinute = Number(minute)
+  const targetHour = Number(hour)
+
+  const now = new Date()
+  const results = []
+
+  const dateFmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+  })
+  const displayFmt = new Intl.DateTimeFormat('zh-CN', {
+    timeZone, month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  })
+
+  for (let day = 0; results.length < n && day < 366; day++) {
+    // 该天在目标时区的日期
+    const dayDate = new Date(now.getTime() + day * 86400000)
+    const [y, m, d] = dateFmt.format(dayDate).split('-').map(Number)
+    // 先按 UTC 构造目标时刻，再减去目标时区在该时刻的偏移，得到真实 UTC 时间戳
+    const naiveUtc = Date.UTC(y, m - 1, d, targetHour, targetMinute)
+    const offsetMs = timezoneOffsetMs(timeZone, new Date(naiveUtc))
+    const actualUtc = naiveUtc - offsetMs
+    if (actualUtc > now.getTime()) {
+      results.push(displayFmt.format(new Date(actualUtc)))
+    }
+  }
+  return results
+}
+
+export { beijingDateStr, isBeijingSunday, nextCronRuns }

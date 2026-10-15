@@ -33,6 +33,7 @@ import { close_api, delay, send, startService, waitForApi } from '../utils/utils
 import { upsertUser, writeUserinfoFile, parseUserinfoJson } from '../utils/userinfo.js'
 import { maskIdentifier, summarizeResponse } from '../utils/safeLog.js'
 import { printGreen, printMagenta, printRed, printYellow } from '../utils/colorOut.js'
+import { nextCronRuns } from '../utils/date.js'
 
 const require = createRequire(import.meta.url)
 const QRCode = require('qrcode')
@@ -245,30 +246,9 @@ function startCheckin(trigger = 'manual') {
 
 // ────────────────────────── 计划预览 ──────────────────────────
 
-/** 预览 "分 时 * * *" 形式的 cron 接下来 n 次执行时间（北京时间固定 UTC+8） */
+/** 预览 cron 接下来 n 次执行时间（按 CRON_TIMEZONE 时区计算） */
 function nextRuns(n = 3) {
-  const fields = SCHEDULE.trim().split(/\s+/)
-  const [minute, hour] = fields
-  if (
-    fields.length !== 5 ||
-    !/^\d+$/.test(minute) || !/^\d+$/.test(hour) ||
-    fields.slice(2).some(f => f !== '*')
-  ) return []
-
-  const fmt = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: TIMEZONE, month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-  })
-  const now = new Date()
-  const list = []
-  for (let day = 0; list.length < n && day < 366; day++) {
-    const t = Date.UTC(
-      now.getUTCFullYear(), now.getUTCMonth(),
-      now.getUTCDate() + day, Number(hour) - 8, Number(minute)
-    )
-    if (t > now.getTime()) list.push(fmt.format(new Date(t)))
-  }
-  return list
+  return nextCronRuns(SCHEDULE, TIMEZONE, n)
 }
 
 // ────────────────────────── Express 应用 ──────────────────────────
@@ -312,14 +292,61 @@ function accountsState(ip) {
   return st
 }
 
-/** 提取请求中提供的账号管理密码（头 / 查询参数 / JSON body） */
-function providedAccountsKey(req) {
-  const v = req.headers['x-accounts-key'] ?? req.query.key ?? req.body?.password
-  return v == null ? '' : String(v)
+/** ── 每账号独立密码 + admin 管理员 ──
+ * 密码哈希存于凭据同目录的 accounts_auth.json（仅存显式修改过密码的账号）；
+ * 未设置过密码的账号，默认密码为其酷狗ID 本身；
+ * admin 为预留管理员账号，密码为环境变量 ACCOUNTS_PASSWORD（未设置则 admin 不可用），可查看/管理所有账号。
+ */
+const ACCOUNTS_AUTH_FILE = path.join(path.dirname(USERINFO_FILE), 'accounts_auth.json')
+
+/** 账号密码哈希（静态盐，避免通用彩虹表；不是高安全场景，仅防明文落盘） */
+function hashAccountPassword(pwd) {
+  return crypto.createHash('sha256').update(`kgcheckin:${pwd}`).digest('hex')
+}
+
+function readAccountsAuth() {
+  try {
+    // 兼容 UTF-8 BOM
+    return JSON.parse(fs.readFileSync(ACCOUNTS_AUTH_FILE, 'utf8').replace(/^﻿/, '')) || {}
+  } catch { return {} }
+}
+
+function saveAccountsAuth(map) {
+  const tmp = `${ACCOUNTS_AUTH_FILE}.tmp`
+  try {
+    fs.mkdirSync(path.dirname(ACCOUNTS_AUTH_FILE), { recursive: true })
+    fs.writeFileSync(tmp, JSON.stringify(map, null, 2), 'utf8')
+    fs.renameSync(tmp, ACCOUNTS_AUTH_FILE)
+    return true
+  } catch (e) {
+    printRed(`[webui] 写入账号密码文件失败：${e.message}`)
+    try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略 */ }
+    return false
+  }
+}
+
+/** 提取请求中提供的账号身份凭据（头 / 查询参数 / JSON body） */
+function providedAccountsCreds(req) {
+  const id = req.headers['x-accounts-id'] ?? req.query.id ?? req.body?.userid
+  const key = req.headers['x-accounts-key'] ?? req.query.key ?? req.body?.password
+  return { id: id == null ? '' : String(id).trim(), key: key == null ? '' : String(key) }
+}
+
+/** 校验身份：成功返回作用域 { admin:true } 或 { admin:false, userid }；失败返回 null */
+function verifyAccountsCreds(id, key) {
+  if (!id || !key) return null
+  if (id === 'admin') {
+    return ACCOUNTS_PASSWORD && safeEqual(key, ACCOUNTS_PASSWORD) ? { admin: true } : null
+  }
+  // 账号必须存在于凭据文件（防止任意 userid 探测登录）
+  if (!readUserinfo().some(u => String(u.userid) === id)) return null
+  const stored = readAccountsAuth()[id]
+  // 未改过密码：默认密码 = 酷狗ID；改过：比对哈希
+  const ok = stored ? safeEqual(hashAccountPassword(key), stored) : safeEqual(key, id)
+  return ok ? { admin: false, userid: id } : null
 }
 
 function accountsGuard(req, res, next) {
-  if (!ACCOUNTS_PASSWORD) return next()
   const st = accountsState(req.ip)
   const now = Date.now()
 
@@ -332,14 +359,16 @@ function accountsGuard(req, res, next) {
     })
   }
 
-  const provided = providedAccountsKey(req)
-  // 未提供密码不算失败：前端打开面板即会先请求，此处只提示需要密码
-  if (!provided) {
-    return res.status(401).json({ error: '账号管理已锁定，请输入密码', code: 'accounts-auth', needPassword: true })
+  const { id, key } = providedAccountsCreds(req)
+  // 未提供凭据不算失败：前端打开面板即会先请求，此处只提示需要凭据
+  if (!id && !key) {
+    return res.status(401).json({ error: '账号管理已锁定，请输入酷狗ID和密码', code: 'accounts-auth', needPassword: true })
   }
 
-  if (safeEqual(provided, ACCOUNTS_PASSWORD)) {
+  const scope = verifyAccountsCreds(id, key)
+  if (scope) {
     st.fails = 0
+    req.accountsScope = scope
     return next()
   }
 
@@ -356,7 +385,7 @@ function accountsGuard(req, res, next) {
   }
   printYellow(`[webui] 账号管理：${req.ip} 密码错误（第 ${st.fails}/${ACCOUNTS_MAX_ATTEMPTS} 次）`)
   return res.status(401).json({
-    error: `账号管理密码错误，剩余尝试次数 ${ACCOUNTS_MAX_ATTEMPTS - st.fails}`,
+    error: `酷狗ID或密码错误，剩余尝试次数 ${ACCOUNTS_MAX_ATTEMPTS - st.fails}`,
     code: 'accounts-auth',
     attemptsLeft: ACCOUNTS_MAX_ATTEMPTS - st.fails,
   })
@@ -391,7 +420,7 @@ app.get('/api/status', wrap(async (req, res) => {
     },
     // 只暴露账号数量；账号明细走受独立密码保护的 GET /api/accounts
     accountCount: readUserinfo().length,
-    accountsLockEnabled: Boolean(ACCOUNTS_PASSWORD),
+    accountsLockEnabled: true,
     apiServiceRunning: loginApi.running(),
   })
 }))
@@ -543,11 +572,11 @@ app.get('/api/checkin/logs', (req, res) => {
   })
 })
 
-// ── 账号管理（受 accountsGuard 独立密码锁保护）──
+// ── 账号管理（受 accountsGuard 保护：每账号独立密码，admin 可管理全部）──
 
-/** 验证独立密码（解锁面板用）；失败计数与锁定由 accountsGuard 统一处理 */
+/** 验证身份凭据（解锁面板用）；失败计数与锁定由 accountsGuard 统一处理 */
 app.post('/api/accounts/unlock', wrap(async (req, res) => {
-  res.json({ ok: true })
+  res.json({ ok: true, admin: req.accountsScope.admin })
 }))
 
 /** 账号管理面板展示用：解析账号昵称（完整、不脱敏；面板本身受独立密码保护）。
@@ -570,27 +599,40 @@ async function resolveAccountNicknames(accounts) {
     } catch { /* API 服务不可用：本次仅返回已存昵称 */ }
     if (missing.some(u => u.nickname)) {
       // 回写昵称（含完整 token，仅写本地凭据文件；失败不致命，下次加载会重新懒加载）
-      saveUserinfo(accounts)
+      saveUserinfo(readUserinfo().map(u => {
+        const found = accounts.find(a => String(a.userid) === String(u.userid))
+        return found && found.nickname ? { ...u, nickname: found.nickname } : u
+      }))
     }
   }
   return accounts.map(u => (u.nickname ? String(u.nickname) : null))
 }
 
+/** 按身份作用域过滤账号：admin 见全部；普通用户仅见自己 */
+function scopeFilter(accounts, scope) {
+  if (scope.admin) return accounts.map((u, i) => ({ u, i }))
+  return accounts.map((u, i) => ({ u, i })).filter(({ u }) => String(u.userid) === scope.userid)
+}
+
 app.get('/api/accounts', wrap(async (req, res) => {
-  const accounts = readUserinfo()
-  const nicknames = await resolveAccountNicknames(accounts)
+  const scope = req.accountsScope
+  const all = readUserinfo()
+  const visible = scopeFilter(all, scope)
+  const nicknames = await resolveAccountNicknames(visible.map(v => v.u))
   res.json({
-    accounts: accounts.map((u, i) => ({
+    accounts: visible.map(({ u, i }, vi) => ({
       index: i,
       userid: maskIdentifier(u.userid),
-      nickname: nicknames[i],
+      nickname: nicknames[vi],
       tokenLength: String(u.token || '').length,
     })),
-    lockEnabled: Boolean(ACCOUNTS_PASSWORD),
+    admin: scope.admin,
+    lockEnabled: true,
   })
 }))
 
 app.delete('/api/accounts/:index', wrap(async (req, res) => {
+  const scope = req.accountsScope
   const index = parseInt(req.params.index, 10)
   const arr = readUserinfo()
   if (!Number.isInteger(index) || index < 0 || index >= arr.length) {
@@ -598,11 +640,53 @@ app.delete('/api/accounts/:index', wrap(async (req, res) => {
     err.status = 404
     throw err
   }
-  const removed = maskIdentifier(arr[index].userid)
+  // 非 admin 只能删除自己的账号
+  if (!scope.admin && String(arr[index].userid) !== scope.userid) {
+    const err = new Error('只能删除自己的账号')
+    err.status = 403
+    throw err
+  }
+  const removedUserid = String(arr[index].userid)
+  const removed = maskIdentifier(removedUserid)
   arr.splice(index, 1)
   saveUserinfo(arr)
+  // 清理该账号的自定义密码（若存在）
+  const auth = readAccountsAuth()
+  if (removedUserid in auth) {
+    delete auth[removedUserid]
+    saveAccountsAuth(auth)
+  }
   printYellow(`[webui] 已删除账号 ${removed}，剩余 ${arr.length} 个账号`)
   res.json({ ok: true, remaining: arr.length })
+}))
+
+/** 修改账号密码：普通用户只能改自己；admin 可改任意账号（body.userid 指定目标，缺省改自己无意义——admin 密码在环境变量） */
+app.post('/api/accounts/password', wrap(async (req, res) => {
+  const scope = req.accountsScope
+  const newPwd = String(req.body?.newPassword || '')
+  if (!newPwd || newPwd.length < 4 || newPwd.length > 64) {
+    const err = new Error('新密码长度需为 4-64 位')
+    err.status = 400
+    throw err
+  }
+  const targetUserid = scope.admin && req.body?.targetUserid
+    ? String(req.body.targetUserid)
+    : scope.userid
+  if (scope.admin && req.body?.targetUserid && !readUserinfo().some(u => String(u.userid) === targetUserid)) {
+    const err = new Error('目标账号不存在')
+    err.status = 404
+    throw err
+  }
+  if (scope.admin && !req.body?.targetUserid) {
+    const err = new Error('admin 密码由环境变量 ACCOUNTS_PASSWORD 管理，请指定 targetUserid 修改对应账号密码')
+    err.status = 400
+    throw err
+  }
+  const auth = readAccountsAuth()
+  auth[targetUserid] = hashAccountPassword(newPwd)
+  saveAccountsAuth(auth)
+  printYellow(`[webui] 账号 ${maskIdentifier(targetUserid)} 的密码已更新`)
+  res.json({ ok: true })
 }))
 
 // ── 兜底 ──
@@ -628,7 +712,7 @@ app.listen(WEBUI_PORT, () => {
   printYellow(`  下次执行: ${nextRuns(1)[0] || '-'}`)
   printYellow(`  凭据文件: ${USERINFO_FILE}（${readUserinfo().length} 个账号）`)
   printYellow(`  访问密码: ${WEBUI_PASSWORD ? '已启用' : '未启用（仅建议在可信内网使用）'}`)
-  printYellow(`  账号管理锁: ${ACCOUNTS_PASSWORD ? `已启用（${ACCOUNTS_MAX_ATTEMPTS} 次错误锁定 ${Math.round(ACCOUNTS_LOCK_MINUTES)} 分钟）` : '未启用（设置 ACCOUNTS_PASSWORD 开启）'}`)
+  printYellow(`  账号管理锁: 已启用（每账号独立密码，默认密码=酷狗ID；admin 由 ACCOUNTS_PASSWORD ${ACCOUNTS_PASSWORD ? '启用' : '未启用'}；${ACCOUNTS_MAX_ATTEMPTS} 次错误锁定 ${Math.round(ACCOUNTS_LOCK_MINUTES)} 分钟）`)
 
   if (cron.validate(SCHEDULE)) {
     cron.schedule(SCHEDULE, () => {

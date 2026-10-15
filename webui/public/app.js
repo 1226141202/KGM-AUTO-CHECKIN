@@ -153,9 +153,13 @@ function renderAccounts(accounts) {
   accounts.forEach(acct => {
     const div = document.createElement('div')
     div.className = 'account-item'
+    // 昵称（完整，后端已按面板授权返回）显示在 userid 左侧；无昵称时保持原布局
+    const nameHtml = acct.nickname
+      ? `<span class="acct-name">${escapeHtml(acct.nickname)}</span><span class="acct-sep">·</span>`
+      : ''
     div.innerHTML = `
       <div class="acct-main">
-        <div class="acct-id"><span class="idx">[${acct.index}]</span>userid: ${acct.userid}</div>
+        <div class="acct-id"><span class="idx">[${acct.index}]</span>${nameHtml}userid: ${acct.userid}</div>
         <div class="acct-sub">token: ****（${acct.tokenLength} 字符）· 每周日签到时自动刷新</div>
       </div>`
     const btn = document.createElement('button')

@@ -550,11 +550,40 @@ app.post('/api/accounts/unlock', wrap(async (req, res) => {
   res.json({ ok: true })
 }))
 
+/** 账号管理面板展示用：解析账号昵称（完整、不脱敏；面板本身受独立密码保护）。
+ *  凭据文件已存昵称时直接返回；缺失时经 /user/detail 懒加载并回写文件。
+ *  单个账号失败（token 过期/网络异常等）不影响其余账号，也不阻断列表接口。
+ *  注意：不得在日志中输出完整昵称。 */
+async function resolveAccountNicknames(accounts) {
+  const missing = accounts.filter(u => !u.nickname)
+  if (missing.length) {
+    try {
+      await withApi(async () => {
+        for (const u of missing) {
+          try {
+            const headers = { cookie: `token=${u.token}; userid=${u.userid}` }
+            const detail = await send(`/user/detail?timestrap=${Date.now()}`, 'GET', headers)
+            if (detail?.data?.nickname != null) u.nickname = String(detail.data.nickname)
+          } catch { /* 单账号失败跳过，保持无昵称 */ }
+        }
+      })
+    } catch { /* API 服务不可用：本次仅返回已存昵称 */ }
+    if (missing.some(u => u.nickname)) {
+      // 回写昵称（含完整 token，仅写本地凭据文件；失败不致命，下次加载会重新懒加载）
+      saveUserinfo(accounts)
+    }
+  }
+  return accounts.map(u => (u.nickname ? String(u.nickname) : null))
+}
+
 app.get('/api/accounts', wrap(async (req, res) => {
+  const accounts = readUserinfo()
+  const nicknames = await resolveAccountNicknames(accounts)
   res.json({
-    accounts: readUserinfo().map((u, i) => ({
+    accounts: accounts.map((u, i) => ({
       index: i,
       userid: maskIdentifier(u.userid),
+      nickname: nicknames[i],
       tokenLength: String(u.token || '').length,
     })),
     lockEnabled: Boolean(ACCOUNTS_PASSWORD),

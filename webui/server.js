@@ -322,6 +322,13 @@ app.use('/api', (req, res, next) => {
   return res.status(401).json({ error: '未授权：请在页面右上角输入访问密码', code: 'webui-auth' })
 })
 
+// 容器健康检查端点：刻意放在密码校验之外且不访问 /api/*，
+// 否则设置了 WEBUI_PASSWORD 后健康检查会因 401 而被误判为不健康。
+// 仅回传存活信息，不泄露账号数量、调度配置等任何细节。
+app.get('/healthz', (req, res) => {
+  res.status(200).json({ ok: true, uptime: Math.floor(process.uptime()) })
+})
+
 // ── 账号管理模块独立密码锁（防爆破）──
 // 与全局访问密码相互独立。防爆破采用「IP + 目标账号」双维度：
 //   - per-IP：防止单机对多个账号扫描；阈值放宽（同 NAT 用户不应互相拖累）

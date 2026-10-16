@@ -33,7 +33,21 @@ services:
       # ── WebUI ──
       WEBUI_PORT: "3000"
       WEBUI_PASSWORD: ${WEBUI_PASSWORD:-}   # 可选访问密码，在 .env 中设置；公网暴露时强烈建议启用
-      ACCOUNTS_PASSWORD: ${ACCOUNTS_PASSWORD:-}   # 账号管理 admin 管理员密码（普通账号默认密码=酷狗ID本身）；连续 3 次错误锁定 5 分钟
+      # 部署在 Nginx/Caddy 等反向代理之后时设为 1，以信任 X-Forwarded-For 取真实客户端 IP。
+      # 未设置则不信任该头（防止伪造 IP 绕过防爆破计数）；仅直连时无需设置。
+      WEBUI_TRUST_PROXY: ${WEBUI_TRUST_PROXY:-}
+      # ── 账号管理 ──
+      # admin 管理员密码。未修改过密码的普通账号，其默认密码即酷狗ID。
+      ACCOUNTS_PASSWORD: ${ACCOUNTS_PASSWORD:-}
+      # 首次启动且尚无密码文件时，用它初始化 admin 密码（之后可删除该变量）
+      ACCOUNTS_BOOTSTRAP_PASSWORD: ${ACCOUNTS_BOOTSTRAP_PASSWORD:-}
+      # 防爆破：单账号 / 单 IP 双维度锁定（默认 3 次 / 15 次，锁定 5 分钟）
+      ACCOUNTS_MAX_ATTEMPTS: ${ACCOUNTS_MAX_ATTEMPTS:-}
+      ACCOUNTS_IP_MAX_ATTEMPTS: ${ACCOUNTS_IP_MAX_ATTEMPTS:-}
+      ACCOUNTS_LOCK_MINUTES: ${ACCOUNTS_LOCK_MINUTES:-}
+      # 设为 true 关闭「默认密码 = 酷狗ID」；此后未设密码的账号须由 admin 先设置密码。
+      # 公网暴露时建议设为 true（酷狗ID 对他人可见，知道 ID 即可登录并改密）。
+      ACCOUNTS_DISABLE_ID_DEFAULT: ${ACCOUNTS_DISABLE_ID_DEFAULT:-}
       # ── 酷狗设备标识（建议固定：频繁更换设备会被风控静默丢弃验证码短信；在 .env 中设置）──
       KUGOU_API_GUID: ${KUGOU_API_GUID:-}
       KUGOU_API_MID: ${KUGOU_API_MID:-}
@@ -44,6 +58,8 @@ services:
       CRON_TIMEZONE: Asia/Shanghai     # 调度器使用的时区
       RUN_ON_STARTUP: "false"          # true：容器启动后立即执行一次签到
       CHECKIN_CONCURRENCY: ${CHECKIN_CONCURRENCY:-}   # 多账号并行：默认全部账号同时并行；设 N 限 N 路；1 = 逐个串行
+      # 设为 true 时跳过「当日已完成签到」的账号，避免重复请求酷狗接口（默认关闭）
+      CHECKIN_SKIP_DONE: ${CHECKIN_SKIP_DONE:-}
       # ── 凭据（二选一）──
       # 方式一（推荐）：在 WebUI 里扫码/手机号登录，凭据自动保存到挂载卷 data/userinfo.json
       # 方式二：直接贴入已有的 USERINFO（与 GitHub Actions 的 Secret 格式一致）
@@ -74,3 +90,11 @@ services:
       # CHECKIN_API_PORT: "3020"       # 容器内签到子进程 API 服务端口
     volumes:
       - ./data:/app/data               # 凭据 userinfo.json（token 周刷新自动写回）
+    # 容器健康检查：命中 WebUI 的免鉴权 /healthz（不依赖 curl，alpine 镜像内自带 node）。
+    # 注意不要改成 /api/status —— 该接口受 WEBUI_PASSWORD 保护，设了密码后会一直 401。
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.WEBUI_PORT||3000)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

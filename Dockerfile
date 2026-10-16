@@ -39,11 +39,18 @@ USER node
 # 凭据文件与二维码输出统一放到挂载卷内
 ENV USERINFO_FILE=/app/data/userinfo.json \
     QR_DIR=/app/data/qr \
-    QR_KEYS_FILE=/app/data/qrkeys.json
+    QR_KEYS_FILE=/app/data/qrkeys.json \
+    WEBUI_PORT=3000
 
 # 容器内端口规划（无需对外全部暴露）：
 #   3000 WebUI 控制台（compose 按需映射）
 #   3010 登录用常驻 API 服务（webui/server.js 懒启动）
 #   3020 签到子进程专用 API 服务（每次签到临时拉起）
+#
+# 健康检查：命中 WebUI 的免鉴权 /healthz（设了 WEBUI_PASSWORD 也返回 200）。
+# 用 node 内置 fetch，无需额外安装 curl。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD node -e "fetch('http://127.0.0.1:'+(process.env.WEBUI_PORT||3000)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["node", "webui/server.js"]

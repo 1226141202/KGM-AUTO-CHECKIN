@@ -71,6 +71,13 @@ docker compose logs -f        # 查看日志，Ctrl+C 退出（容器继续运�
 
 容器启动后同时具备 **WebUI 控制台 + 定时自动签到**，无需任何其他配置。
 
+容器内置健康检查（每 30 秒探测 WebUI 的 `/healthz`，该端点不受 `WEBUI_PASSWORD` 保护），可用 `docker ps` 查看状态：
+
+```bash
+docker ps                       # STATUS 列显示 (healthy) 即正常
+docker inspect --format '{{.State.Health.Status}}' kgcheckin
+```
+
 ### 3. WebUI 控制台（推荐）
 
 浏览器打开 `http://<服务器IP>:3000`，即可使用终端风格的可视化控制台：

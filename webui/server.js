@@ -220,21 +220,31 @@ function startCheckin(trigger = 'manual') {
   pushLog('sys', `────── 签到任务开始（${trigger === 'cron' ? '定时调度' : trigger === 'startup' ? '启动触发' : '手动触发'} · ${startedAt}）──────`)
   broadcast('start', checkinState.lastRun)
 
+  const userinfoRaw = readUserinfoRaw()
+
+  // 凭据通过 stdin 传给子进程，而不是放进环境变量：
+  // 环境变量可被同容器/同主机的其他进程经 /proc/<pid>/environ 读取，等于把 token 暴露给任意进程。
   const env = { ...process.env, API_PORT: CHECKIN_API_PORT }
+  delete env.USERINFO           // 防止父进程环境变量里的旧凭据泄漏给子进程
+  if (userinfoRaw) env.USERINFO_STDIN = '1'
   // 手动触发时跳过当日已完成签到的账号（定时/启动触发不设置，保持完整执行）
   if (trigger === 'manual') {
     env.CHECKIN_SKIP_DONE = '1'
-  }
-  const userinfoRaw = readUserinfoRaw()
-  if (userinfoRaw) {
-    env.USERINFO = userinfoRaw
   }
 
   const child = spawn(process.execPath, [path.join(ROOT, 'main.js')], {
     cwd: ROOT,
     env,
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
   })
+
+  // 写入凭据后立即关闭 stdin，供子进程读取
+  if (userinfoRaw) {
+    child.stdin.on('error', () => { /* 子进程提前退出时忽略 EPIPE */ })
+    child.stdin.end(userinfoRaw, 'utf8')
+  } else {
+    child.stdin.end()
+  }
 
   const onStream = buf => {
     for (const line of String(buf).split(/\r?\n/)) {

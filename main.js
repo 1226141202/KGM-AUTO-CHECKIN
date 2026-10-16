@@ -7,9 +7,42 @@ import { writeUserinfoFile, parseUserinfoJson } from "./utils/userinfo.js";
 import { beijingDateStr, isBeijingSunday } from "./utils/date.js";
 import { checkinStateEnabled, loadDoneToday, saveDoneToday } from "./utils/checkinState.js";
 
+/**
+ * 读取进程 stdin 的全部内容（用于从父进程安全接收凭据）。
+ * 环境变量可被同容器/同主机的其他进程通过 /proc/<pid>/environ 读取，
+ * 因此 WebUI 调用签到子进程时改用 stdin 传递凭据。
+ * @returns {Promise<string>} 去除首尾空白后的文本
+ */
+function readStdin() {
+  return new Promise(resolve => {
+    // 无 stdin（如 Actions/定时任务不设置该标记时不会走到这里）
+    if (!process.stdin || process.stdin.isTTY) return resolve('')
+    let data = ''
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('data', chunk => { data += chunk })
+    process.stdin.on('end', () => resolve(data.trim()))
+    process.stdin.on('error', () => resolve(data.trim()))
+  })
+}
+
+/**
+ * 获取 USERINFO 原始文本。优先级：
+ *   1. USERINFO 环境变量（GitHub Actions / Docker entrypoint 兼容路径）
+ *   2. USERINFO_STDIN=1 时从 stdin 读取（WebUI 子进程路径，避免凭据进入环境变量）
+ * @returns {Promise<string>}
+ */
+async function loadUserinfoRaw() {
+  const fromEnv = process.env.USERINFO
+  if (fromEnv && fromEnv.trim()) return fromEnv
+  if (['1', 'true', 'yes', 'on'].includes(String(process.env.USERINFO_STDIN || '').trim().toLowerCase())) {
+    return await readStdin()
+  }
+  return ''
+}
+
 async function main() {
 
-  const USERINFO = process.env.USERINFO
+  const USERINFO = await loadUserinfoRaw()
   let needRefresh = false
   const userinfo = parseUserinfoJson(USERINFO)
   if (!userinfo) {

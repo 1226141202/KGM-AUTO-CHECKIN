@@ -49,6 +49,27 @@ async function waitForApi(base = apiBase(), timeoutMs = 20000) {
   throw new Error(`本地 API 服务在 ${timeoutMs}ms 内未就绪`)
 }
 
+/**
+ * api 子进程需要的环境变量白名单。
+ * 原先 `{ ...process.env }` 会把 MAIL_PASS、PAT、各通知渠道密钥等一并复制给
+ * api 子进程（同容器进程可经 /proc/<pid>/environ 读取），这里收敛为必需项。
+ * api/server.js 仍会自行读取工作目录下的 .env，故白名单不影响其功能。
+ */
+const API_ENV_ALLOW = [
+  'PATH', 'HOME', 'TZ', 'LANG', 'LC_ALL', 'NODE_ENV', 'PORT', 'HOST',
+  'KUGOU_API_GUID', 'KUGOU_API_MID', 'KUGOU_API_DEV', 'KUGOU_API_MAC',
+  'KUGOU_API_WEBGL', 'KUGOU_API_PLATFORM', 'platform', 'CORS_ALLOW_ORIGIN',
+]
+
+/** 按白名单筛选环境变量（另附显式覆盖项） */
+function pickApiEnv(overrides = {}) {
+  const out = {}
+  for (const key of API_ENV_ALLOW) {
+    if (process.env[key] !== undefined) out[key] = process.env[key]
+  }
+  return { ...out, ...overrides }
+}
+
 /** 启动 api 服务（detached 使其成为独立进程组，便于整组强杀） */
 function startService() {
   // 直接以 node 运行 api/app.js（与 npm run apiService → node app.js 等价）：
@@ -59,7 +80,7 @@ function startService() {
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
     // api 服务监听端口与客户端 base 保持一致（api/server.js 读取 PORT）
-    env: { ...process.env, PORT: apiPort() },
+    env: pickApiEnv({ PORT: apiPort() }),
   })
 
   api.stdout.on('data', () => {})

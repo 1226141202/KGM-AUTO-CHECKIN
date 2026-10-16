@@ -78,6 +78,18 @@ body {
 .chip.err { color: var(--red); border-color: rgba(248, 81, 73, 0.4); }
 .chip.info { color: var(--cyan); border-color: rgba(88, 166, 255, 0.4); }
 
+/* 账号面板：默认密码（酷狗ID）登录时的醒目提示条 */
+#accounts-default-pwd-warn.warn {
+  color: var(--yellow);
+  background: rgba(210, 153, 34, 0.1);
+  border: 1px solid rgba(210, 153, 34, 0.4);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  line-height: 1.5;
+  white-space: normal;
+}
+
 /* ───────────── 标签页 ───────────── */
 
 .tabs {

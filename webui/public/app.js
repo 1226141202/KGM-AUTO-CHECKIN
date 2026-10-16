@@ -145,12 +145,20 @@ function showAccountsLock(msg, isErr) {
   el.className = isErr ? 'err' : 'dim'
 }
 
-function renderAccounts(accounts, admin) {
+function renderAccounts(accounts, admin, mustChangePassword) {
   const box = $('#account-list')
   $('#accounts-lock').hidden = true
   $('#accounts-content').hidden = false
   $('#accounts-who').textContent = admin ? '// 当前身份：admin（管理员）' : `// 当前身份：${ACCOUNTS_ID}`
   $('#btn-accounts-passwd').hidden = false
+  // 以默认密码（酷狗ID）登录：提示尽快修改，避免他人凭 ID 登录并改密
+  const warn = $('#accounts-default-pwd-warn')
+  if (warn) {
+    warn.hidden = !mustChangePassword
+    warn.textContent = mustChangePassword
+      ? '⚠ 当前使用的是默认密码（酷狗ID）。酷狗ID 对他人可见，请立即点击「修改密码」设置自己的密码。'
+      : ''
+  }
   if (!accounts.length) {
     box.innerHTML = '<div class="empty dim">// 暂无账号，请先在「扫码登录」或「手机号登录」中添加</div>'
     return
@@ -163,7 +171,9 @@ function renderAccounts(accounts, admin) {
     const nameHtml = acct.nickname
       ? `<span class="acct-name">${escapeHtml(acct.nickname)}</span><span class="acct-sep">·</span>`
       : ''
-    const noPwdHint = acct.hasPassword ? '' : '<div class="acct-sub warn">⚠ 尚未设置管理密码，需由 admin 设置后才能自助登录</div>'
+    const noPwdHint = acct.hasPassword
+      ? ''
+      : '<div class="acct-sub warn">⚠ 仍在使用默认密码（酷狗ID），建议尽快修改</div>'
     div.innerHTML = `
       <div class="acct-main">
         <div class="acct-id"><span class="idx">[${acct.index}]</span>${nameHtml}userid: ${acct.userid}</div>
@@ -225,7 +235,7 @@ async function loadAccounts() {
   clearInterval(accountsTimer)
   try {
     const r = await api('/api/accounts')
-    renderAccounts(r.accounts, r.admin)
+    renderAccounts(r.accounts, r.admin, r.mustChangePassword)
   } catch (e) {
     if (e.status === 423) {
       lockdownAccounts(e.data && e.data.retryAfter, e.message)

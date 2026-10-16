@@ -14,8 +14,8 @@
  *                     未设置时不信任该头，避免伪造 IP 绕过按 IP 的防爆破计数。
  *   ACCOUNTS_PASSWORD admin 管理员密码；设置后 admin 可查看/管理所有账号（未设置则 admin 不可用）
  *   ACCOUNTS_BOOTSTRAP_PASSWORD 首次启动（尚无 accounts_auth.json）时用它初始化 admin 密码
- *   ACCOUNTS_ALLOW_ID_DEFAULT 兼容开关（默认关闭）：允许未设密码的账号以「酷狗ID 作为密码」登录。
- *                     仅用于平滑迁移，开启后建议尽快为账号设置密码并关闭。
+ *   ACCOUNTS_DISABLE_ID_DEFAULT 设为 true 时关闭「未设密码账号可用酷狗ID 登录」（默认允许，便于首次改密）。
+ *                     酷狗ID 并非秘密，公网暴露时建议设 true 并让 admin 预先分发密码。
  *   ACCOUNTS_MAX_ATTEMPTS 单账号连续错误锁定阈值（默认 3）
  *   ACCOUNTS_IP_MAX_ATTEMPTS 单 IP 连续错误锁定阈值（默认 ACCOUNTS_MAX_ATTEMPTS × 5）
  *   ACCOUNTS_LOCK_MINUTES 锁定时长（默认 5 分钟）
@@ -64,9 +64,11 @@ const ACCOUNTS_IP_MAX_ATTEMPTS = Math.max(
   ACCOUNTS_MAX_ATTEMPTS,
   parseInt(process.env.ACCOUNTS_IP_MAX_ATTEMPTS || String(ACCOUNTS_MAX_ATTEMPTS * 5), 10) || ACCOUNTS_MAX_ATTEMPTS * 5
 )
-// 兼容开关：允许"默认密码 = 酷狗ID"的旧行为（默认关闭）。开启仅用于平滑迁移。
-const ACCOUNTS_ALLOW_ID_DEFAULT = ['1', 'true', 'yes', 'on'].includes(
-  String(process.env.ACCOUNTS_ALLOW_ID_DEFAULT || '').trim().toLowerCase()
+// 未设置密码的账号是否允许以「酷狗ID 作为默认密码」登录（默认允许，便于用户首次改密）。
+// 设为 true 可关闭该行为，此时未设密码的账号必须由 admin 先设置密码。
+// ⚠ 酷狗ID 并非秘密，开启默认密码意味着知道 ID 的人即可登录并改密，公网部署请谨慎。
+const ACCOUNTS_DISABLE_ID_DEFAULT = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.ACCOUNTS_DISABLE_ID_DEFAULT || '').trim().toLowerCase()
 )
 // 首次启动用于初始化 admin 的引导密码（accounts_auth.json 不存在时使用）
 const ACCOUNTS_BOOTSTRAP_PASSWORD = String(process.env.ACCOUNTS_BOOTSTRAP_PASSWORD || '').trim()
@@ -368,8 +370,9 @@ function clearFails(map, key) {
  * 密码哈希存于凭据同目录的 accounts_auth.json。
  * 存储格式：{ "<userid>": { algo:'scrypt', salt:'<hex>', hash:'<hex>' } }
  * 旧格式（裸 sha256 hex 字符串）在登录成功后惰性迁移为 scrypt。
- * 未设置过密码的账号默认拒绝登录；仅当 ACCOUNTS_ALLOW_ID_DEFAULT=true 时
- * 才回退到"默认密码 = 酷狗ID"的旧行为（并在登录后提示改密）。
+ * 未设置过密码的账号，默认密码即其酷狗ID（便于用户登录后自助修改密码）；
+ * 该行为可用 ACCOUNTS_DISABLE_ID_DEFAULT=true 关闭。
+ * ⚠ 酷狗ID 并非秘密：保留默认密码意味着知道 ID 的人即可登录该账号并改密。
  * admin 为预留管理员账号，密码为环境变量 ACCOUNTS_PASSWORD（未设置则 admin 不可用）。
  */
 const ACCOUNTS_AUTH_FILE = path.join(path.dirname(USERINFO_FILE), 'accounts_auth.json')
@@ -471,16 +474,21 @@ function verifyAccountsCreds(id, key, req) {
   const stored = auth[id]
 
   if (!stored) {
-    // 未设置过密码：默认拒绝。仅在显式开启兼容开关时回退到"密码=酷狗ID"，
-    // 且额外限制：只允许回环来源使用该回退，避免公网直接撞库。
-    if (ACCOUNTS_ALLOW_ID_DEFAULT && isLoopback(req) && safeEqual(key, id)) {
+    // 未设置过密码的账号：默认密码即酷狗ID（用户可凭此登录后自助修改密码）。
+    //
+    // ⚠ 安全提示：酷狗ID 并非秘密（账号列表接口会返回，用户之间也会互相告知），
+    //   因此任何知道该 ID 的人都能登录此账号并修改密码，把号主锁在外面。
+    //   该策略仅为"便于用户首次改密"而保留；若面板对公网暴露，建议：
+    //     1) 设置 WEBUI_PASSWORD，或
+    //     2) 由 admin 预先为各账号设置密码（设置后此分支不再生效），或
+    //     3) 设置 ACCOUNTS_DISABLE_ID_DEFAULT=true 关闭该行为。
+    if (ACCOUNTS_DISABLE_ID_DEFAULT) return { needInitPassword: true }
+    if (safeEqual(key, id)) {
       return { admin: false, userid: id, mustChangePassword: true }
     }
-    if (ACCOUNTS_ALLOW_ID_DEFAULT && safeEqual(key, id)) {
-      // 非回环来源且开关开启：允许登录但强制改密
-      return { admin: false, userid: id, mustChangePassword: true }
-    }
-    return { needInitPassword: true }
+    // 默认密码已启用但用户输入的不是酷狗ID：属于密码错误，必须计入失败次数，
+    // 否则可对未设密码的账号无限次尝试（needInitPassword 不计失败）。
+    return null
   }
 
   const { ok, needsRehash } = verifyPassword(key, stored)
@@ -531,9 +539,9 @@ function accountsGuard(req, res, next) {
   const scope = verifyAccountsCreds(id, key, req)
 
   if (scope && scope.needInitPassword) {
-    // 未初始化密码：不计失败，明确提示初始化路径
+    // 未设置过密码且默认密码已被关闭（ACCOUNTS_DISABLE_ID_DEFAULT=true）
     return res.status(401).json({
-      error: '该账号尚未设置管理密码，请先用 admin 账号为其设置密码',
+      error: '该账号尚未设置密码，且默认密码已关闭；请联系管理员为其设置密码',
       code: 'accounts-auth',
       needInitPassword: true,
     })
@@ -820,11 +828,12 @@ app.get('/api/accounts', wrap(async (req, res) => {
       rawUserid: String(u.userid),
       nickname: nicknames[vi],
       tokenLength: String(u.token || '').length,
-      // 是否已设置管理密码：未设置时前端提示用 admin 设置
+      // 是否已自行设置过密码：false 表示当前仍在使用「酷狗ID」作为默认密码
       hasPassword: Boolean(auth[String(u.userid)]),
     })),
     admin: scope.admin,
     lockEnabled: true,
+    // 以默认密码（酷狗ID）登录时为 true，前端据此提示尽快改密
     mustChangePassword: Boolean(scope.mustChangePassword),
   })
 }))
@@ -908,13 +917,6 @@ app.post('/api/accounts/password', wrap(async (req, res) => {
     ? (req.body?.targetUserid ? String(req.body.targetUserid) : 'admin')
     : scope.userid
 
-  // 禁止把密码设置成酷狗ID 本身（等于没有密码），admin 除外
-  if (targetUserid !== 'admin' && newPwd === targetUserid) {
-    const err = new Error('密码不能与酷狗ID相同，请设置更安全的密码')
-    err.status = 400
-    throw err
-  }
-
   if (targetUserid !== 'admin' && !readUserinfo().some(u => String(u.userid) === targetUserid)) {
     const err = new Error('目标账号不存在')
     err.status = 404
@@ -959,8 +961,12 @@ app.listen(WEBUI_PORT, () => {
   printYellow(`  凭据文件: ${USERINFO_FILE}（${readUserinfo().length} 个账号）`)
   printYellow(`  访问密码: ${WEBUI_PASSWORD ? '已启用' : '未启用（仅建议在可信内网使用）'}`)
   printYellow(`  账号管理: 每账号独立密码（scrypt）· admin ${ACCOUNTS_PASSWORD || readAccountsAuth().admin ? '已启用' : '未启用'} · 账号 ${ACCOUNTS_MAX_ATTEMPTS} 次 / IP ${ACCOUNTS_IP_MAX_ATTEMPTS} 次错误锁定 ${Math.round(ACCOUNTS_LOCK_MINUTES)} 分钟`)
-  if (ACCOUNTS_ALLOW_ID_DEFAULT) {
-    printYellow('  ⚠ ACCOUNTS_ALLOW_ID_DEFAULT 已开启：未设密码的账号仍可用「酷狗ID 作为密码」登录，建议为账号设置密码后关闭')
+  if (ACCOUNTS_DISABLE_ID_DEFAULT) {
+    printYellow('  账号默认密码: 已关闭（未设密码的账号需由 admin 设置密码后才能登录）')
+  } else {
+    printYellow('  ⚠ 账号默认密码 = 酷狗ID（便于用户首次登录后自行改密）')
+    printYellow('    酷狗ID 在账号列表与用户之间可见，知道 ID 即可登录该账号并改密；')
+    printYellow('    公网部署建议设置 WEBUI_PASSWORD，或设 ACCOUNTS_DISABLE_ID_DEFAULT=true 并分发密码。')
   }
   if (!readAccountsAuth().admin && !ACCOUNTS_PASSWORD) {
     printYellow('  提示：未配置 ACCOUNTS_PASSWORD，admin 不可用；可设 ACCOUNTS_BOOTSTRAP_PASSWORD 初始化 admin 密码')

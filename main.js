@@ -242,6 +242,10 @@ async function main() {
   if (stateEnabled) {
     if (saveDoneToday(date, doneSet)) {
       printYellow(`今日已完成签到的账号已记录（${doneSet.size} 个），手动触发时将自动跳过`)
+    } else {
+      // 写盘失败不应中断签到，但必须显式告警：静默失败会让"手动触发跳过已签到"
+      // 悄悄失效（如 Actions 环境下无 USERINFO_FILE、默认 data 目录不可写）。
+      printYellow(`警告：当日签到状态写入失败（${doneSet.size} 个账号未记录），手动触发将不会跳过已签到账号`)
     }
   }
 

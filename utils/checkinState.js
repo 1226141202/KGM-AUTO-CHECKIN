@@ -10,6 +10,10 @@
  * 状态文件默认位于凭据文件同目录（Docker 中为挂载卷 /app/data/checkin_state.json），
  * 按"北京时间日期"滚动，跨天自动失效；文件内容形如：
  *   { "date": "2026-02-06", "done": ["123456789", "987654321"] }
+ *
+ * 契约：
+ *   - loadDoneToday 始终返回 Set（异常/跨天时为空集合）
+ *   - saveDoneToday 只接受可迭代集合；失败返回 false（调用方应告警，勿静默忽略）
  */
 
 import fs from 'node:fs'
@@ -23,7 +27,12 @@ function stateFile() {
   return path.join(base, 'checkin_state.json')
 }
 
-/** 读取今日已完成签到的账号 userid 集合；非当日 / 文件损坏时返回空集合 */
+/**
+ * 读取今日已完成签到的账号 userid 集合。
+ * 始终返回 Set（非当日 / 文件损坏 / 不存在时返回空集合），保证调用方可直接用 .add()/.has()。
+ * @param {string} today 北京时间日期（YYYY-MM-DD）
+ * @returns {Set<string>}
+ */
 export function loadDoneToday(today) {
   try {
     const text = fs.readFileSync(stateFile(), 'utf8').replace(/^\uFEFF/, '')
@@ -35,8 +44,19 @@ export function loadDoneToday(today) {
   }
 }
 
-/** 原子化写入当日状态（tmp + rename），失败时静默返回 false（不影响签到流程） */
+/**
+ * 原子化写入当日状态（tmp + rename）。
+ * 失败时返回 false（不影响签到流程），调用方应据此告警。
+ * @param {string} today 北京时间日期（YYYY-MM-DD）
+ * @param {Iterable<string>} doneSet 已完成签到的 userid 集合
+ * @returns {boolean} 是否写入成功
+ */
 export function saveDoneToday(today, doneSet) {
+  // 契约校验：必须可迭代。若误传 Map 会被展开成 [key,value] 而静默写出错误内容，
+  // 因此显式拒绝，避免"看起来成功但内容不对"。
+  if (!doneSet || typeof doneSet[Symbol.iterator] !== 'function') {
+    throw new TypeError('saveDoneToday: doneSet 必须是可迭代的 userid 集合（如 Set）')
+  }
   const file = stateFile()
   const tmp = `${file}.tmp`
   try {
@@ -50,7 +70,13 @@ export function saveDoneToday(today, doneSet) {
   }
 }
 
-/** 是否应记录/读取签到状态：配置了凭据文件路径（Docker/本地部署），或显式开启了跳过 */
+/**
+ * 是否应记录/读取签到状态。
+ * 配置了状态文件路径（显式 CHECKIN_STATE_FILE，或凭据文件同目录）即启用；
+ * 手动触发（skipDone）时也启用——此时若目录不可写，写入会失败并由调用方告警。
+ * @param {boolean} skipDone 是否为手动触发
+ * @returns {boolean}
+ */
 export function checkinStateEnabled(skipDone) {
-  return Boolean(process.env.USERINFO_FILE) || skipDone
+  return Boolean(process.env.USERINFO_FILE || process.env.CHECKIN_STATE_FILE) || Boolean(skipDone)
 }

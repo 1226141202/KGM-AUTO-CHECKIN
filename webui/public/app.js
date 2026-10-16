@@ -161,10 +161,12 @@ function renderAccounts(accounts, admin) {
     const nameHtml = acct.nickname
       ? `<span class="acct-name">${escapeHtml(acct.nickname)}</span><span class="acct-sep">·</span>`
       : ''
+    const noPwdHint = acct.hasPassword ? '' : '<div class="acct-sub warn">⚠ 尚未设置管理密码，需由 admin 设置后才能自助登录</div>'
     div.innerHTML = `
       <div class="acct-main">
         <div class="acct-id"><span class="idx">[${acct.index}]</span>${nameHtml}userid: ${acct.userid}</div>
         <div class="acct-sub">token: ****（${acct.tokenLength} 字符）· 每周日签到时自动刷新</div>
+        ${noPwdHint}
       </div>`
     const btn = document.createElement('button')
     btn.className = 'btn danger-ghost'
@@ -172,7 +174,8 @@ function renderAccounts(accounts, admin) {
     btn.addEventListener('click', async () => {
       if (!confirm(`确认删除账号 ${acct.userid}？`)) return
       try {
-        await api(`/api/accounts/${acct.index}`, { method: 'DELETE' })
+        // 按 userid 删除：避免列表在操作期间变化导致误删他人账号
+        await api(`/api/accounts/by-id/${encodeURIComponent(acct.rawUserid)}`, { method: 'DELETE' })
         toast('账号已删除', 'ok')
         loadAccounts()
         refreshStatus()
@@ -349,7 +352,7 @@ function startQrPolling() {
     }
     await Promise.all(pending.map(async item => {
       try {
-        const r = await api(`/api/qr/status?key=${encodeURIComponent(item.key)}`)
+        const r = await api(`/api/qr/status?qrcode=${encodeURIComponent(item.key)}`)
         const statusEl = item.card.querySelector('.qr-status')
         if (r.status === 1) {
           statusEl.textContent = '⏳ 等待扫描…'

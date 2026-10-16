@@ -602,6 +602,8 @@ app.get('/api/status', wrap(async (req, res) => {
       timezone: TIMEZONE,
       valid: cron.validate(SCHEDULE),
       nextRuns: nextRuns(3),
+      // 复杂 cron 表达式无法预览，前端据此给出提示而非显示空白
+      previewSupported: nextRuns(1).length > 0,
     },
     checkin: {
       running: checkinState.running,

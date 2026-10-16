@@ -55,6 +55,11 @@ function runCheckin(skipDone = false) {
 /** 打印接下来 n 次计划执行时间（用于校验 CRON_SCHEDULE 配置） */
 function printUpcoming(n = 3) {
   const runs = nextCronRuns(SCHEDULE, TIMEZONE, n)
+  if (!runs.length) {
+    // 复杂表达式（步进/区间/指定星期等）无法预览，明确提示而非静默留白
+    printYellow(`  计划预览：该表达式（${SCHEDULE}）不支持预览，请以 cron 校验结果为准`)
+    return
+  }
   for (const t of runs) printYellow(`  下一次执行（${TIMEZONE}）：${t}`)
 }
 
@@ -94,7 +99,8 @@ if (mode === 'once') {
 
   if (RUN_ON_STARTUP) {
     printYellow(`[${nowStr()}] RUN_ON_STARTUP=true，容器启动后立即执行一次签到`)
-    runCheckin()
+    // 防御性 catch：runCheckin 内部已 resolve，不会 reject；此处仅兜底避免未处理拒绝
+    runCheckin().catch(err => printRed(`[${nowStr()}] 启动签到异常：${err && err.message ? err.message : err}`))
   }
 
   const shutdown = sig => {

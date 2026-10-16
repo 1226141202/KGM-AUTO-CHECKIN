@@ -155,10 +155,13 @@ async function main() {
             }
           } else if (ad.error_code === 30002) {
             printGreen(`${tag} 今天次数已用光`)
+            // 次数用光：把总次数记为已尝试次数，避免通知里出现 3/7 这类含混计数
+            claimTotal = claimCount
             break
           } else {
             printRed(`${tag} 第${i}次领取失败`)
             accountErrors[`${safeNickname} ad`] = summarizeResponse(ad)
+            claimTotal = claimCount
             break
           }
         }
@@ -179,11 +182,12 @@ async function main() {
           doneSet.add(String(user.userid))
         }
 
+        // 通知中的领取次数：统一显示 "已领取 N 次"，仅在成功 8 次时展示总次数上限
         return {
           nickname: safeNickname,
           status: listenStatus === '失败' || claimCount === 0 ? '部分失败' : '成功',
           listen: listenStatus,
-          vipClaim: `${claimCount}/${claimTotal}`,
+          vipClaim: claimTotal > 0 ? `${claimCount}/${claimTotal}` : `${claimCount}`,
           vipExpiry,
           error: ''
         }

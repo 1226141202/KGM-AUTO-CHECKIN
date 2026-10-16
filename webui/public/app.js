@@ -118,7 +118,9 @@ async function refreshStatus() {
     sched.valid ? 'info' : 'err'
   )
   $('#cron-tip').textContent = sched.valid
-    ? `⏰ 定时签到：${sched.cron}（${sched.timezone}），接下来执行：${sched.nextRuns.join(' / ') || '-'}`
+    ? (sched.previewSupported === false
+        ? `⏰ 定时签到：${sched.cron}（${sched.timezone}）· 该表达式不支持预览执行时间`
+        : `⏰ 定时签到：${sched.cron}（${sched.timezone}），接下来执行：${sched.nextRuns.join(' / ') || '-'}`)
     : '⚠ CRON_SCHEDULE 无效，定时签到未启用，只能手动签到'
 
   setChip('#chip-run', `▮ 签到: ${s.checkin.running ? '运行中' : s.checkin.lastRun ? (s.checkin.lastRun.ok ? '上次成功' : '上次失败') : '从未运行'}`,

@@ -27,7 +27,9 @@ function delay(ms) {
  * 等待本地 api 服务就绪（启动竞态修复）。
  * 原先各脚本在 startService() 后盲目 delay(2000)，
  * 在冷启动的 Actions runner 上可能因服务未就绪导致首个请求失败/超时。
- * 改为轮询探测：服务端口可响应任意 HTTP 即视为就绪，最多等待 timeoutMs。
+ *
+ * 探测 /healthz：该端点不触发任何上游请求、不参与缓存，返回 200 即表示服务已就绪。
+ * 若服务为未包含 /healthz 的旧版本，则回退为"端口可响应任意 HTTP 即视为就绪"。
  * @param {string} base 服务地址
  * @param {number} timeoutMs 最长等待毫秒
  */
@@ -37,10 +39,11 @@ async function waitForApi(base = apiBase(), timeoutMs = 20000) {
     try {
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), 2000)
-      const resp = await fetch(base + '/user/detail', { method: 'GET', signal: controller.signal })
+      const resp = await fetch(base + '/healthz', { method: 'GET', signal: controller.signal })
       clearTimeout(timer)
-      // 任意 HTTP 响应（含 4xx/5xx）都说明服务已在监听端口
-      return true
+      if (resp.ok) return true
+      // 旧版本 api 无 /healthz（404）：退化为"端口已在监听"判定
+      if (resp.status === 404) return true
     } catch (err) {
       // 连接被拒（ECONNREFUSED）等服务尚未就绪，稍后重试
       await delay(500)
@@ -111,8 +114,12 @@ function close_api(api) {
 /**
  * 发送请求到本地 api 服务（带超时 + 重试）
  * 超时 10 秒，失败后指数退避重试最多 3 次
+ * @param {string} apiPath api 服务路径（如 "/user/detail"）——
+ *   参数名刻意避开模块顶部的 path 导入，避免遮蔽
+ * @param {string} method HTTP 方法
+ * @param {Record<string,string>} headers 请求头
  */
-async function send(path, method, headers) {
+async function send(apiPath, method, headers) {
   const MAX_RETRIES = 3
   const TIMEOUT_MS = 10000
   let lastError
@@ -121,7 +128,7 @@ async function send(path, method, headers) {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS)
     try {
-      const resp = await fetch(apiBase() + path, {
+      const resp = await fetch(apiBase() + apiPath, {
         method,
         headers,
         signal: controller.signal,

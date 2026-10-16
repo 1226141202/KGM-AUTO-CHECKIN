@@ -381,6 +381,15 @@ async function consturctServer(moduleDefs) {
   app.use('/docs', express.static(path.join(__dirname, 'docs')));
 
   /**
+   * 健康检查端点。
+   * 供 utils/waitForApi 探活使用：轻量、不触发任何上游请求、不参与缓存。
+   * 语义明确（服务已就绪），避免原先"任意路径返回任意状态码即视为就绪"的模糊判定。
+   */
+  app.get('/healthz', (req, res) => {
+    res.status(200).json({ ok: true, uptime: Math.floor(process.uptime()) });
+  });
+
+  /**
    * ============================================================
    * API 响应缓存中间件
    * ============================================================

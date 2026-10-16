@@ -67,11 +67,12 @@ function timezoneOffsetMs(timeZone, date) {
  * @param {string} schedule  cron 表达式（5 段式）
  * @param {string} timeZone  IANA 时区名（如 "Asia/Shanghai"）
  * @param {number} [n=3]     返回的未来执行次数
- * @returns {string[]}       格式化后的执行时间列表
+ * @returns {string[]}       格式化后的执行时间列表；表达式过于复杂时返回空数组
  */
 function nextCronRuns(schedule, timeZone, n = 3) {
   const fields = schedule.trim().split(/\s+/)
   const [minute, hour] = fields
+  // 步进/区间/列举/指定星期等复杂写法无法在此预览，返回空数组由调用方给出提示
   if (
     fields.length !== 5 ||
     !/^\d+$/.test(minute) || !/^\d+$/.test(hour) ||

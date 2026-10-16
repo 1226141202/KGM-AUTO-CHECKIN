@@ -11,7 +11,7 @@
 登录后即可使用，目前提供二维码登录(推荐)和手机号登录(一个手机号绑定多个账号无法登录，见 [多账号登录问题](https://github.com/MakcRe/KuGouMusicApi/issues/51))
 
 ### 项目试用链接
-账号管理 账号与密码默认使用酷狗ID 请于酷狗概念APP **[我的]→[设置]→[消息和绑定设置]→[酷狗ID]** 查看
+账号管理需输入酷狗ID 与密码（密码由 admin 设置，不再默认等于酷狗ID）；酷狗ID 请于酷狗概念APP **[我的]→[设置]→[消息和绑定设置]→[酷狗ID]** 查看
 
 ```htlm
 https://kg.neteaseapi.cc.cd/
@@ -80,9 +80,11 @@ docker compose logs -f        # 查看日志，Ctrl+C 退出（容器继续运�
 | **扫码登录** | 选择账号数量 → 生成二维码 → 酷狗音乐 APP 扫码确认，凭据自动保存；多账号并行轮询扫码状态 |
 | **手机号登录** | 输入手机号发送验证码（60s 冷却）→ 输入验证码一键登录 |
 | **一键签到** | 点击立即执行签到，实时彩色终端输出（与 Actions 运行日志一致），签到结束显示退出码；**当日已完成签到的账号自动跳过**（不再重复请求酷狗 API；通知单独标记"跳过"，全部跳过时不重复发送通知）；**多账号全部并行签到**（`CHECKIN_CONCURRENCY` 可限流，1 为串行） |
-| **账号管理** | 每账号独立密码：输入酷狗ID+密码（默认密码=酷狗ID本身）仅可查看/管理自己的账号；管理员账号 `admin`（密码为 `ACCOUNTS_PASSWORD`）可查看/管理所有账号；支持修改密码；连续 3 次密码错误锁定 5 分钟（防爆破） |
+| **账号管理** | 每账号独立密码（scrypt 哈希存储）：账号需由 `admin` 设置密码后才能自助登录，仅可查看/管理自己的账号；管理员账号 `admin`（密码为 `ACCOUNTS_PASSWORD`，或用 `ACCOUNTS_BOOTSTRAP_PASSWORD` 首次初始化）可查看/管理所有账号；支持修改密码；防爆破为**单账号 + 单 IP 双维度**锁定（默认账号 3 次 / IP 15 次错误，锁定 5 分钟），单账号被锁不影响其他账号 |
 
 > - 公网暴露时，请在 `.env` 中设置 `WEBUI_PASSWORD`（全局访问密码）与 `ACCOUNTS_PASSWORD`（账号管理 admin 管理员密码），参考 `.env.example`
+> - 部署在反向代理之后时设置 `WEBUI_TRUST_PROXY`，否则所有请求会被视为来自代理 IP（影响防爆破计数）；未设置时系统不会信任 `X-Forwarded-For`，以防伪造 IP 绕过计数
+> - 从旧版本升级：旧版"默认密码 = 酷狗ID"已废弃。如需平滑迁移，可临时设置 `ACCOUNTS_ALLOW_ID_DEFAULT=true` 登录后为各账号设置密码，再关闭该开关
 > - 通知渠道密钥同样建议写在 `.env`（自动注入容器，不会被提交到仓库）
 
 ### 4. 命令行登录（可选）
@@ -131,8 +133,12 @@ docker compose run --rm kgcheckin node scheduler.js once   # 或命令行方式�
 |------|--------|------|
 | `WEBUI_PORT` | `3000` | WebUI 控制台监听端口 |
 | `WEBUI_PASSWORD` | - | 可选访问密码；设置后所有 API 需携带密钥（公网暴露时建议设置，写在 `.env` 中） |
-| `ACCOUNTS_PASSWORD` | - | 账号管理模块 admin 管理员密码；普通账号用 酷狗ID+密码（默认密码=酷狗ID本身）解锁，admin 可管理所有账号；连续 3 次错误锁定 5 分钟 |
-| `ACCOUNTS_MAX_ATTEMPTS` / `ACCOUNTS_LOCK_MINUTES` | `3` / `5` | 可选覆盖防爆破策略（最大错误次数 / 锁定时长） |
+| `ACCOUNTS_PASSWORD` | - | 账号管理模块 admin 管理员密码；账号需由 admin 设置独立密码后才能自助登录（不再默认使用酷狗ID），admin 可管理所有账号 |
+| `ACCOUNTS_BOOTSTRAP_PASSWORD` | - | 首次启动且尚无密码文件时，用它初始化 admin 密码 |
+| `ACCOUNTS_MAX_ATTEMPTS` / `ACCOUNTS_LOCK_MINUTES` | `3` / `5` | 可选覆盖防爆破策略（单账号最大错误次数 / 锁定时长） |
+| `ACCOUNTS_IP_MAX_ATTEMPTS` | `ACCOUNTS_MAX_ATTEMPTS × 5` | 单个 IP 的最大错误次数（放宽以免同 NAT 用户互相影响） |
+| `ACCOUNTS_ALLOW_ID_DEFAULT` | `false` | 兼容开关：允许未设密码的账号以「酷狗ID 作为密码」登录，仅用于从旧版平滑迁移 |
+| `WEBUI_TRUST_PROXY` | - | 部署在反向代理后时设置，以信任 `X-Forwarded-For` 取真实 IP；未设置则不信任（防伪造绕过防爆破） |
 | `CRON_SCHEDULE` | `10 1 * * *` | 签到计划任务（cron 表达式），默认每天北京时间 01:10 |
 | `CRON_TIMEZONE` | `Asia/Shanghai` | 调度器使用的时区 |
 | `RUN_ON_STARTUP` | `false` | 设为 `true` 时容器启动后立即执行一次签到 |

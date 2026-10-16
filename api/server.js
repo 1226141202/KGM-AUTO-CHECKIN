@@ -440,13 +440,8 @@ async function consturctServer(moduleDefs) {
       //   - cookie: 合并请求 Cookie 和 query 中传入的 cookie 参数
       //   - params: query 中除 cookie 外的其余参数
       //   - body: 请求体（POST 数据）
-      // 将 query.cookie 规整为对象后再合并：字符串走 cookieToJson，对象原样，其余视为空；
-      // 同时用新对象合并，避免直接 mutate req.cookies 以及字符串/数组直接 Object.assign 导致的键污染
-      const cookieSource = typeof cookie === 'string'
-        ? cookieToJson(cookie)
-        : (cookie && !Array.isArray(cookie) && typeof cookie === 'object' ? cookie : {});
       const body = Buffer.isBuffer(req.body) ? { data: req.body } : req.body;
-      const query = Object.assign({}, { cookie: Object.assign({}, req.cookies, cookieSource) }, params, body);
+      const query = Object.assign({}, { cookie: Object.assign({}, req.cookies, cookie) }, params, body);
 
       // Step 4: 如果请求携带了 Authorization 头，将其解析为 Cookie 并合并
       // 这样客户端可以通过 Authorization 头传递认证信息，例如: token=xxx;userid=xxx
@@ -478,7 +473,7 @@ async function consturctServer(moduleDefs) {
           return createRequest(config);
         });
 
-        // 请求成功日志
+        // 请求成功日志（URL 经脱敏：token/手机号/userid 等不会写入日志）
         console.log('[OK]', sanitizeUrlForLog(req.originalUrl));
 
         // Step 6: 处理模块返回的 Cookie
@@ -512,7 +507,7 @@ async function consturctServer(moduleDefs) {
         // 异常处理：模块内部错误会被封装为包含 status 和 body 的错误对象抛出
         const moduleResponse = e;
 
-        // 错误日志
+        // 错误日志（URL 与响应体均经脱敏）
         console.log('[ERR]', sanitizeUrlForLog(req.originalUrl), {
           status: moduleResponse.status,
           body: sanitizeBodyForLog(moduleResponse.body),

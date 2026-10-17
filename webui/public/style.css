@@ -325,6 +325,16 @@ select.input { width: auto; min-width: 80px; }
 .term-body .line.err { color: var(--red); }
 .term-body .line .ts { color: #484f58; }
 
+/* 详细日志行：默认（简化模式）隐藏，切到 .term.verbose 时才显示。
+   用 display 而非 visibility，避免隐藏行仍占用滚动高度。 */
+.term:not(.verbose) .term-body .line.muted-line { display: none; }
+
+/* 开关按钮激活态 */
+#btn-toggle-verbose[aria-pressed="true"] {
+  color: var(--green);
+  border-color: var(--green);
+}
+
 /* ANSI 颜色 */
 .c-red { color: var(--red); }
 .c-green { color: var(--green); }

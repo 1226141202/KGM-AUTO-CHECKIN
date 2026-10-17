@@ -467,19 +467,85 @@ function ansiToHtml(raw) {
   return classes.length ? `<span class="${classes.join(' ')}">${html}</span>` : html
 }
 
+/**
+ * 判断一行日志是否属于「详细」级别（简化模式下隐藏）。
+ *
+ * 简化模式只保留：任务开始/结束、每个账号的关键节点（开始领取、成功/失败、
+ * 今日已领取、次数用光）、VIP 到期、以及所有错误。
+ * 隐藏的是高频且可推知的逐次进度（第 N 次领取成功、等待 30 秒）。
+ *
+ * @param {string} text 去除 ANSI 后的纯文本
+ * @returns {boolean} true = 详细日志（简化模式下隐藏）
+ */
+function isVerboseLine(text) {
+  const t = String(text || '').trim()
+  if (!t) return false
+  // 逐次领取进度：「第3次领取成功」——保留最终统计即可，中间过程不显示
+  if (/第\s*\d+\s*次领取成功/.test(t)) return true
+  // 等待提示（8 次领取之间各等 30 秒）
+  if (/等待\s*\d+\s*秒|请稍候/.test(t)) return true
+  // 分隔线类装饰
+  if (/^[─━—=-]{6,}$/.test(t)) return false
+  return false
+}
+
+/** 当前是否显示详细日志（默认简化） */
+let showVerbose = false
+
+/** 依据 showVerbose 切换终端区域的类名 */
+function applyVerboseMode() {
+  const term = $('.term')
+  if (term) term.classList.toggle('verbose', showVerbose)
+  const btn = $('#btn-toggle-verbose')
+  if (btn) {
+    btn.setAttribute('aria-pressed', showVerbose ? 'true' : 'false')
+    btn.textContent = showVerbose ? '[ 简化日志 ]' : '[ 详细日志 ]'
+  }
+  updateEmptyHint()
+}
+
+/**
+ * 简化模式下若所有行都被隐藏（例如只跑了一次快速失败的账号），
+ * 终端会空白。此处给出提示，避免用户误以为卡住。
+ */
+function updateEmptyHint() {
+  const body = $('#term-body')
+  if (!body) return
+  const visible = Array.from(body.children).filter(el => {
+    if (el.classList.contains('empty-hint')) return false
+    if (el.classList.contains('muted-line') && !showVerbose) return false
+    return true
+  })
+  const hint = body.querySelector('.empty-hint')
+  if (visible.length > 0) {
+    if (hint) hint.remove()
+    return
+  }
+  if (!hint && body.children.length > 0) {
+    const div = document.createElement('div')
+    div.className = 'line dim empty-hint'
+    div.textContent = '// 已隐藏详细日志，点击「详细日志」查看完整输出'
+    body.appendChild(div)
+  }
+}
+
 function appendLog(entry) {
   const body = $('#term-body')
   const line = document.createElement('div')
   const ts = entry.ts ? `<span class="ts">${entry.ts.slice(11, 19)}</span> ` : ''
-  line.className = `line ${entry.level === 'log' ? '' : entry.level}`
+  line.className = `line ${entry.level === 'log' ? '' : entry.level}`.trim()
+  // 用纯文本判定详细级别（此时 text 尚未转 HTML，判定更可靠）
+  if (isVerboseLine(entry.text)) line.classList.add('muted-line')
   line.innerHTML = ts + ansiToHtml(entry.text)
   const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 60
+  // 仅移除「等待任务输出」这一条占位提示；空状态提示由 updateEmptyHint 统一管理
   const placeholder = body.querySelector('.dim')
   if (placeholder && placeholder.textContent.includes('等待任务输出')) placeholder.remove()
   body.appendChild(line)
   // 限制 DOM 行数
   while (body.children.length > 800) body.removeChild(body.firstChild)
   if (nearBottom) body.scrollTop = body.scrollHeight
+  updateEmptyHint()
 }
 
 function clearTerm() {
@@ -487,6 +553,17 @@ function clearTerm() {
 }
 
 $('#btn-clear-log').addEventListener('click', clearTerm)
+
+// 详细日志开关：默认关闭（简化显示），用户选择记忆在 localStorage
+$('#btn-toggle-verbose').addEventListener('click', () => {
+  showVerbose = !showVerbose
+  applyVerboseMode()
+  try { localStorage.setItem('kg-verbose-log', showVerbose ? '1' : '0') } catch { /* 隐私模式忽略 */ }
+})
+
+// 恢复上次选择；默认简化
+try { showVerbose = localStorage.getItem('kg-verbose-log') === '1' } catch { showVerbose = false }
+applyVerboseMode()
 
 let sse = null
 

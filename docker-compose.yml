@@ -60,6 +60,9 @@ services:
       CHECKIN_CONCURRENCY: ${CHECKIN_CONCURRENCY:-}   # 多账号并行：默认全部账号同时并行；设 N 限 N 路；1 = 逐个串行
       # 设为 true 时跳过「当日已完成签到」的账号，避免重复请求酷狗接口（默认关闭）
       CHECKIN_SKIP_DONE: ${CHECKIN_SKIP_DONE:-}
+      # 手动「立即签到」限流：同一 IP 每 N 小时仅可触发一次（内网/本机 IP 豁免）。
+      # 默认 12 小时；设为 0 关闭该限制。
+      CHECKIN_MANUAL_COOLDOWN_HOURS: ${CHECKIN_MANUAL_COOLDOWN_HOURS:-12}
       # ── 凭据（二选一）──
       # 方式一（推荐）：在 WebUI 里扫码/手机号登录，凭据自动保存到挂载卷 data/userinfo.json
       # 方式二：直接贴入已有的 USERINFO（与 GitHub Actions 的 Secret 格式一致）

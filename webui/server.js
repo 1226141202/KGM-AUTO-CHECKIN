@@ -79,6 +79,58 @@ const TIMEZONE = process.env.CRON_TIMEZONE || 'Asia/Shanghai'
 const RUN_ON_STARTUP = ['1', 'true', 'yes', 'on'].includes(String(process.env.RUN_ON_STARTUP || '').toLowerCase())
 const IDLE_SHUTDOWN_MS = 10 * 60 * 1000
 
+// ── 手动「立即签到」限流 ──
+// 防止公网用户反复触发签到（每次都会拉起 API 子进程并请求酷狗接口）。
+// 默认同一 IP 12 小时内仅可触发一次；设为 0 可完全关闭。
+// 内网 / 本机来源豁免（见 isPrivateIp），不影响本机运维与反向代理转发。
+const CHECKIN_MANUAL_COOLDOWN_HOURS = (() => {
+  const raw = String(process.env.CHECKIN_MANUAL_COOLDOWN_HOURS ?? '').trim()
+  if (raw === '') return 12                 // 默认 12 小时
+  const n = parseFloat(raw)
+  return Number.isFinite(n) && n >= 0 ? n : 12
+})()
+const CHECKIN_MANUAL_COOLDOWN_MS = CHECKIN_MANUAL_COOLDOWN_HOURS * 60 * 60 * 1000
+// ip -> 上次成功触发的时间戳（毫秒）。仅保留未过期的桶，避免无限增长。
+const manualCheckinLastAt = new Map()
+const MANUAL_CHECKIN_MAP_MAX = 5000
+
+/**
+ * 查询某 IP 的手动签到冷却状态。
+ * @param {string} ip
+ * @returns {{ blocked: boolean, remainingMs: number, lastAt: number }}
+ */
+function manualCheckinCooldown(ip) {
+  if (CHECKIN_MANUAL_COOLDOWN_MS <= 0) return { blocked: false, remainingMs: 0, lastAt: 0 }
+  const key = normalizeIp(ip)
+  const lastAt = manualCheckinLastAt.get(key) || 0
+  const elapsed = Date.now() - lastAt
+  const remainingMs = lastAt ? Math.max(0, CHECKIN_MANUAL_COOLDOWN_MS - elapsed) : 0
+  return { blocked: remainingMs > 0, remainingMs, lastAt }
+}
+
+/** 记录某 IP 的一次成功触发，并顺带清理过期桶。 */
+function markManualCheckin(ip) {
+  if (CHECKIN_MANUAL_COOLDOWN_MS <= 0) return
+  const now = Date.now()
+  const key = normalizeIp(ip)
+  manualCheckinLastAt.set(key, now)
+  if (manualCheckinLastAt.size > MANUAL_CHECKIN_MAP_MAX) {
+    for (const [k, v] of manualCheckinLastAt) {
+      if (now - v >= CHECKIN_MANUAL_COOLDOWN_MS) manualCheckinLastAt.delete(k)
+    }
+  }
+}
+
+/** 把剩余毫秒格式化为「X 小时 Y 分钟」（中文提示用）。 */
+function formatRemaining(ms) {
+  const totalMin = Math.max(1, Math.ceil(ms / 60000))
+  const h = Math.floor(totalMin / 60)
+  const m = totalMin % 60
+  if (h > 0 && m > 0) return `${h} 小时 ${m} 分钟`
+  if (h > 0) return `${h} 小时`
+  return `${m} 分钟`
+}
+
 // 本进程内 utils（startService/send/waitForApi）统一使用登录专用端口
 process.env.API_PORT = WEBUI_API_PORT
 if (!process.env.USERINFO_FILE) {
@@ -305,6 +357,41 @@ function clientIp(req) {
 function isLoopback(req) {
   const ip = clientIp(req)
   return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1'
+}
+
+/**
+ * 归一化 IP：去掉 IPv4-mapped IPv6 前缀，便于统一比较。
+ * @param {string} ip
+ * @returns {string}
+ */
+function normalizeIp(ip) {
+  const s = String(ip || '').trim().toLowerCase()
+  return s.startsWith('::ffff:') ? s.slice(7) : s
+}
+
+/**
+ * 是否为内网 / 本机地址（RFC1918 + 回环 + IPv6 链路本地与 ULA）。
+ * 用于「手动签到」限流豁免：内网运维操作不应被外网防滥用策略误伤。
+ * 注意：这只是可用性豁免，不是安全边界——外网请求经反向代理后 req.ip
+ * 为代理内网地址时会被豁免，因此 WEBUI_TRUST_PROXY 必须正确配置。
+ * @param {string} rawIp
+ * @returns {boolean}
+ */
+function isPrivateIp(rawIp) {
+  const ip = normalizeIp(rawIp)
+  if (!ip) return false
+  if (ip === '127.0.0.1' || ip === '::1' || ip === 'localhost') return true
+  // IPv6 链路本地 fe80::/10 与 ULA fc00::/7
+  if (ip.includes(':')) return ip.startsWith('fe80:') || /^f[cd][0-9a-f]{2}:/.test(ip)
+  const m = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (!m) return false
+  const [a, b] = [Number(m[1]), Number(m[2])]
+  if (a === 10) return true                       // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return true // 172.16.0.0/12
+  if (a === 192 && b === 168) return true          // 192.168.0.0/16
+  if (a === 169 && b === 254) return true          // 169.254.0.0/16（含 Docker 内网）
+  if (a === 127) return true                       // 127.0.0.0/8
+  return false
 }
 
 /** 计时安全的字符串比较（先散列到等长，避免时序侧信道） */
@@ -751,7 +838,26 @@ app.post('/api/checkin/run', wrap(async (req, res) => {
     err.status = 400
     throw err
   }
+
+  // 手动触发的限流：同一 IP 每 12 小时仅一次（内网/本机豁免）。
+  // 放在凭据校验之后：未登录的请求仍返回 400，不会被误报为「已触发」。
+  const ip = clientIp(req)
+  if (!isPrivateIp(ip) && CHECKIN_MANUAL_COOLDOWN_MS > 0) {
+    const cd = manualCheckinCooldown(ip)
+    if (cd.blocked) {
+      const err = new Error(
+        `该 IP 已触发过签到，需等待 ${formatRemaining(cd.remainingMs)} 后才能再次手动触发`
+      )
+      err.status = 429
+      err.code = 'manual-checkin-cooldown'
+      err.retryAfterMs = cd.remainingMs
+      throw err
+    }
+  }
+
   startCheckin('manual')
+  // 仅在真正启动任务后记账，避免"启动了但立刻失败"之外的误伤
+  if (!isPrivateIp(ip)) markManualCheckin(ip)
   res.status(202).json({ ok: true })
 }))
 
@@ -947,6 +1053,10 @@ app.use('/api', (req, res) => res.status(404).json({ error: '接口不存在' })
 app.use((err, req, res, next) => {
   const status = err.status || 500
   if (status >= 500) printRed(`[webui] ${req.method} ${req.path} 失败：${err.message}`)
+  // 限流类错误附带标准 Retry-After（秒），便于客户端/脚本自动等待
+  if (err.retryAfterMs > 0) {
+    res.set('Retry-After', String(Math.ceil(err.retryAfterMs / 1000)))
+  }
   res.status(status).json({ error: err.message })
 })
 
@@ -980,6 +1090,11 @@ app.listen(WEBUI_PORT, () => {
   }
   if (WEBUI_TRUST_PROXY) {
     printYellow(`  反向代理: 已信任 X-Forwarded-For（WEBUI_TRUST_PROXY=${WEBUI_TRUST_PROXY}）`)
+  }
+  if (CHECKIN_MANUAL_COOLDOWN_MS > 0) {
+    printYellow(`  手动签到限流: 同一 IP 每 ${CHECKIN_MANUAL_COOLDOWN_HOURS} 小时仅可触发一次（内网/本机豁免）`)
+  } else {
+    printYellow('  手动签到限流: 已关闭（CHECKIN_MANUAL_COOLDOWN_HOURS=0）')
   }
 
   if (cron.validate(SCHEDULE)) {

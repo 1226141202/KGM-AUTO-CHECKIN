@@ -129,12 +129,16 @@ async function main() {
         const listen = await send(`/youth/listen/song?timestrap=${Date.now()}`, "GET", headers)
 
         let listenStatus = '未知'
+        // 听歌是否成功（含"今日已领取"）：决定该账号当日是否已被标记为完成
+        let listenOk = false
         if (listen.status === 1) {
           printGreen(`${tag} 听歌领取成功`)
           listenStatus = '成功'
+          listenOk = true
         } else if (listen.error_code === 130012) {
           printGreen(`${tag} 今日已领取`)
           listenStatus = '今日已领取'
+          listenOk = true
         } else {
           accountErrors[`${safeNickname} listen`] = summarizeResponse(listen)
           printRed(`${tag} 听歌领取失败`)
@@ -144,6 +148,9 @@ async function main() {
         printYellow(`${tag} 开始领取VIP...`)
         let claimCount = 0
         let claimTotal = 0
+        // 领取阶段是否出现"非预期"失败：仅此类失败阻止当天标记完成。
+        // 次数用光（30002）属于正常终态，不算失败。
+        let claimFailed = false
         for (let i = 1; i <= 8; i++) {
           const ad = await send(`/youth/vip?timestrap=${Date.now()}`, "GET", headers)
           claimTotal = i
@@ -161,6 +168,7 @@ async function main() {
           } else {
             printRed(`${tag} 第${i}次领取失败`)
             accountErrors[`${safeNickname} ad`] = summarizeResponse(ad)
+            claimFailed = true
             claimTotal = claimCount
             break
           }
@@ -177,9 +185,17 @@ async function main() {
           accountErrors[`${safeNickname} vip_details`] = summarizeResponse(vip_details)
         }
 
-        // 全程无错（含"今日已领取"与"次数已用光"）即视为当日已完成签到，写入状态供手动触发跳过
-        if (Object.keys(accountErrors).length === 0 && stateEnabled) {
+        // 当日"已完成"的判定口径：
+        //   听歌成功（含今日已领取）即视为当日该做的已完成——后续 8 次领取广告位失败
+        //   多为酷狗侧限流/风控（如 20028），手动重跑也不会成功，只会重复请求并报错。
+        //   因此仅当「听歌本身失败」或「VIP 详情查询失败」时才不标记完成，保留重试机会。
+        // 注意：领取失败仍会写入 accountErrors 并出现在"异常信息如下"中，只是不再阻止跳过。
+        const vipDetailFailed = Boolean(accountErrors[`${safeNickname} vip_details`])
+        if (listenOk && !vipDetailFailed && stateEnabled) {
           doneSet.add(String(user.userid))
+          if (claimFailed) {
+            printYellow(`${tag} 今日听歌已完成，领取失败不影响标记（手动触发将跳过该账号）`)
+          }
         }
 
         // 通知中的领取次数：统一显示 "已领取 N 次"，仅在成功 8 次时展示总次数上限
@@ -237,7 +253,9 @@ async function main() {
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, userinfo.length) }, worker))
 
     notifyResults.push(...results)
-    hasError = Object.keys(errorMsg).length > 0
+    // 仅「听歌/凭据/VIP详情」类错误算失败；广告位领取失败（键名以 " ad" 结尾）属降级告警：
+    // 该账号当日仍被标记完成、不会重跑，因此不应让整轮运行判定为异常。
+    hasError = Object.keys(errorMsg).some(k => !k.endsWith(' ad'))
   } finally {
     close_api(api)
   }
@@ -289,7 +307,10 @@ async function main() {
     if (Object.keys(errorMsg).length > 0) {
       printRed("异常信息如下:")
       console.dir(sanitizeForLog(errorMsg), { depth: null })
-      throw new Error("领取异常")
+      // 只剩广告位失败时不视为异常（该账号当日已标记完成，重跑无意义）
+      if (Object.keys(errorMsg).some(k => !k.endsWith(' ad'))) {
+        throw new Error("领取异常")
+      }
     }
     if (secretError) {
       throw secretError
@@ -328,7 +349,11 @@ async function main() {
   if (Object.keys(errorMsg).length > 0) {
     printRed("异常信息如下:")
     console.dir(sanitizeForLog(errorMsg), { depth: null })
-    throw new Error("领取异常")
+    // 仅广告位失败（已标记完成、次日才重试）不抛出，避免把正常完成误报为失败
+    if (Object.keys(errorMsg).some(k => !k.endsWith(' ad'))) {
+      throw new Error("领取异常")
+    }
+    printYellow("以上仅为领取广告位失败，账号当日已标记完成，次日再试")
   }
 
   if (secretError) {

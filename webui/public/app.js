@@ -468,11 +468,24 @@ function ansiToHtml(raw) {
 }
 
 /**
+ * 判断一行日志是否为「已跳过」行（账号今日已签到）。
+ *
+ * 账号多时这类行会成批出现（每个账号一行），简化模式下全部收起，
+ * 改为在批次结束后输出一行汇总，而不是让 N 行淹没关键信息。
+ *
+ * @param {string} text 已剥离 ANSI 的纯文本
+ * @returns {boolean}
+ */
+function isSkipLine(text) {
+  return /账号\s*\S+\s*今日已签到，跳过/.test(String(text || ''))
+}
+
+/**
  * 判断一行日志是否属于「详细」级别（简化模式下隐藏）。
  *
  * 简化模式只保留：任务开始/结束、每个账号的关键节点（开始领取、成功/失败、
  * 今日已领取、次数用光）、VIP 到期、以及所有错误。
- * 隐藏的是高频且可推知的逐次进度（第 N 次领取成功、等待 30 秒）。
+ * 隐藏的是高频且可推知的类型：逐次领取进度、等待提示、以及成批的「已跳过」行。
  *
  * @param {string} text 去除 ANSI 后的纯文本
  * @returns {boolean} true = 详细日志（简化模式下隐藏）
@@ -480,12 +493,12 @@ function ansiToHtml(raw) {
 function isVerboseLine(text) {
   const t = String(text || '').trim()
   if (!t) return false
-  // 逐次领取进度：「第3次领取成功」——保留最终统计即可，中间过程不显示
+  // 逐次领取成功：「第3次领取成功」——保留最终统计即可，中间过程不显示
   if (/第\s*\d+\s*次领取成功/.test(t)) return true
   // 等待提示（8 次领取之间各等 30 秒）
   if (/等待\s*\d+\s*秒|请稍候/.test(t)) return true
-  // 分隔线类装饰
-  if (/^[─━—=-]{6,}$/.test(t)) return false
+  // 已跳过：账号多时成批刷屏，改用末尾汇总行代替
+  if (isSkipLine(t)) return true
   return false
 }
 
@@ -511,8 +524,10 @@ function applyVerboseMode() {
 function updateEmptyHint() {
   const body = $('#term-body')
   if (!body) return
+  // 汇总行在简化模式下是可见内容，算作「有内容」
   const visible = Array.from(body.children).filter(el => {
     if (el.classList.contains('empty-hint')) return false
+    if (el.classList.contains('skip-summary')) return !showVerbose
     if (el.classList.contains('muted-line') && !showVerbose) return false
     return true
   })
@@ -529,6 +544,58 @@ function updateEmptyHint() {
   }
 }
 
+/**
+ * 折叠连续的「已跳过」行。
+ *
+ * 账号多时每个已签到账号都会输出一行「账号 xxx 今日已签到，跳过」，
+ * 21 个账号就是 21 行，会把真正有信息量的内容挤走。
+ *
+ * 做法：原始行仍按原样插入 DOM（切到详细模式即可看到全部明细），
+ * 简化模式下在「末尾连续的一段跳过行」之后附加一条汇总行显示数量。
+ * 汇总行随本批数量递增就地更新；一旦来了非跳过行，本批结束，
+ * 汇总行保留在它应在的位置，后续再出现的跳过行会开启新的一批。
+ *
+ * @param {HTMLElement} line 刚插入的日志行
+ */
+function foldSkipLines(line) {
+  const body = $('#term-body')
+  if (!body) return
+
+  // 本行不是跳过行 → 本批结束（既有汇总行留在原处），无需处理
+  if (!isSkipLine(line.textContent)) return
+
+  // 向上回溯本批：连续的跳过行。
+  // 需跨过两类非内容行：上一次留下的汇总行、以及简化模式下的空状态提示行
+  // （后者在第 1 条跳过行进来时就会插入，若不跨过会把同批切断）。
+  const batch = [line]
+  for (let el = line.previousElementSibling; el; el = el.previousElementSibling) {
+    if (el.classList.contains('skip-summary') || el.classList.contains('empty-hint')) continue
+    if (isSkipLine(el.textContent)) batch.push(el)
+    else break                                            // 遇到其他日志 → 本批到此
+  }
+
+  // 移除本批范围内遗留的所有汇总行（从本批首行到当前行之间），
+  // 已结束批次的汇总行不在该区间内，因此不受影响。
+  const firstRow = batch[batch.length - 1]
+  const stale = []
+  for (let el = firstRow; el; el = el.nextElementSibling) {
+    if (el.classList.contains('skip-summary')) stale.push(el)
+    if (el === line) break
+  }
+  // 当前行之后也可能残留一条（上一轮插在末尾的）
+  const after = line.nextElementSibling
+  if (after && after.classList.contains('skip-summary')) stale.push(after)
+  for (const el of stale) el.remove()
+
+  const count = batch.length
+  const summary = document.createElement('div')
+  summary.className = 'line skip-summary'
+  summary.textContent = count > 1
+    ? `// 本批 ${count} 个账号今日已签到，已跳过（点击「详细日志」查看明细）`
+    : '// 该账号今日已签到，已跳过（点击「详细日志」查看明细）'
+  line.after(summary)
+}
+
 function appendLog(entry) {
   const body = $('#term-body')
   const line = document.createElement('div')
@@ -542,6 +609,8 @@ function appendLog(entry) {
   const placeholder = body.querySelector('.dim')
   if (placeholder && placeholder.textContent.includes('等待任务输出')) placeholder.remove()
   body.appendChild(line)
+  // 折叠连续的「已跳过」行：原始行保留在 DOM 中，简化模式另加一行数量汇总
+  foldSkipLines(line)
   // 限制 DOM 行数
   while (body.children.length > 800) body.removeChild(body.firstChild)
   if (nearBottom) body.scrollTop = body.scrollHeight

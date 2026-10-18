@@ -195,6 +195,35 @@ main {
 .run-block .row { margin-bottom: 0; }
 .run-block .input { max-width: 240px; }
 
+/* 方案 B：面板标题右侧的齿轮图标按钮（管理员功能入口） */
+.panel-head { display: flex; align-items: baseline; gap: 4px; flex-wrap: wrap; }
+.icon-btn {
+  margin-left: auto;
+  padding: 2px 8px;
+  font-size: 15px;
+  line-height: 1.2;
+  color: var(--dim);
+  border-color: transparent;
+  background: transparent;
+}
+.icon-btn:hover:not(:disabled) {
+  color: var(--green);
+  border-color: var(--border-light);
+  box-shadow: none;
+}
+.icon-btn.active {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+/* 搜索命中高亮 */
+mark.hit {
+  background: rgba(210, 168, 255, 0.28);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
 .field { margin-bottom: 16px; }
 .field > label {
   display: block;

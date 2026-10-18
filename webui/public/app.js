@@ -153,12 +153,30 @@ function showAccountsLock(msg, isErr) {
   el.className = isErr ? 'err' : 'dim'
 }
 
+/** 账号列表的原始数据与当前搜索词（重新渲染时复用，避免搜索后刷新丢失） */
+let accountsCache = []
+let accountsAdmin = false
+let accountsSearch = ''
+
+/**
+ * 按昵称或酷狗ID 过滤账号。
+ * 两种字段都做「包含」匹配，且忽略大小写，便于输入部分 ID 或昵称片段。
+ * @param {Array} list
+ * @param {string} keyword
+ */
+function filterAccounts(list, keyword) {
+  const kw = String(keyword || '').trim().toLowerCase()
+  if (!kw) return list
+  return list.filter(a => {
+    const id = String(a.rawUserid || '')
+    const nick = String(a.nickname || '')
+    return id.toLowerCase().includes(kw) || nick.toLowerCase().includes(kw)
+  })
+}
+
 function renderAccounts(accounts, admin, mustChangePassword) {
-  const box = $('#account-list')
-  $('#accounts-lock').hidden = true
-  $('#accounts-content').hidden = false
-  $('#accounts-who').textContent = admin ? '// 当前身份：admin（管理员）' : `// 当前身份：${ACCOUNTS_ID}`
-  $('#btn-accounts-passwd').hidden = false
+  accountsCache = accounts
+  accountsAdmin = admin
   // 以默认密码（酷狗ID）登录：提示尽快修改，避免他人凭 ID 登录并改密
   const warn = $('#accounts-default-pwd-warn')
   if (warn) {
@@ -167,12 +185,41 @@ function renderAccounts(accounts, admin, mustChangePassword) {
       ? '⚠ 当前使用的是默认密码（酷狗ID）。酷狗ID 对他人可见，请立即点击「修改密码」设置自己的密码。'
       : ''
   }
+  renderAccountList()
+}
+
+/** 仅重绘列表部分（搜索时调用，不重复处理外层状态） */
+function renderAccountList() {
+  const box = $('#account-list')
+  const accounts = accountsCache
+  const admin = accountsAdmin
+  $('#accounts-lock').hidden = true
+  $('#accounts-content').hidden = false
+  $('#accounts-who').textContent = admin ? '// 当前身份：admin（管理员）' : `// 当前身份：${ACCOUNTS_ID}`
+  $('#btn-accounts-passwd').hidden = false
+
   if (!accounts.length) {
     box.innerHTML = '<div class="empty dim">// 暂无账号，请先在「扫码登录」或「手机号登录」中添加</div>'
+    const cnt = $('#accounts-search-count')
+    if (cnt) cnt.textContent = ''
     return
   }
+
+  const shown = filterAccounts(accounts, accountsSearch)
+  const cntEl = $('#accounts-search-count')
+  if (cntEl) {
+    cntEl.textContent = accountsSearch.trim()
+      ? `// 匹配 ${shown.length} / ${accounts.length} 个账号`
+      : `// 共 ${accounts.length} 个账号`
+  }
+
+  if (!shown.length) {
+    box.innerHTML = `<div class="empty dim">// 没有匹配「${escapeHtml(accountsSearch.trim())}」的账号</div>`
+    return
+  }
+
   box.innerHTML = ''
-  accounts.forEach(acct => {
+  shown.forEach(acct => {
     const div = document.createElement('div')
     div.className = 'account-item'
     // 昵称（完整，后端已按面板授权返回）显示在 userid 左侧；无昵称时保持原布局
@@ -186,9 +233,11 @@ function renderAccounts(accounts, admin, mustChangePassword) {
     const vipHtml = acct.vipExpiry
       ? `<div class="acct-sub">VIP 到期: <span class="vip-expiry">${escapeHtml(String(acct.vipExpiry))}</span></div>`
       : '<div class="acct-sub dim">VIP 到期: 未获取（下次签到后显示）</div>'
+    // userid 完整显示（面板本身受独立密码保护）；搜索高亮匹配片段
+    const idHtml = highlightMatch(String(acct.userid), accountsSearch)
     div.innerHTML = `
       <div class="acct-main">
-        <div class="acct-id"><span class="idx">[${acct.index}]</span>${nameHtml}userid: ${acct.userid}</div>
+        <div class="acct-id"><span class="idx">[${acct.index}]</span>${nameHtml}userid: ${idHtml}</div>
         <div class="acct-sub">token: ****（${acct.tokenLength} 字符）· 每周日签到时自动刷新</div>
         ${vipHtml}
         ${noPwdHint}
@@ -212,6 +261,17 @@ function renderAccounts(accounts, admin, mustChangePassword) {
     div.appendChild(btn)
     box.appendChild(div)
   })
+}
+
+/** 把文本中与搜索词匹配的部分包成高亮 span（先转义再做匹配，避免 XSS） */
+function highlightMatch(text, keyword) {
+  const safe = escapeHtml(text)
+  const kw = String(keyword || '').trim()
+  if (!kw) return safe
+  const safeKw = escapeHtml(kw)
+  const idx = safe.toLowerCase().indexOf(safeKw.toLowerCase())
+  if (idx === -1) return safe
+  return `${safe.slice(0, idx)}<mark class="hit">${safe.slice(idx, idx + safeKw.length)}</mark>${safe.slice(idx + safeKw.length)}`
 }
 
 /** 锁定倒计时：禁用输入与按钮，结束自动恢复 */
@@ -794,6 +854,30 @@ async function refreshQuota() {
 $('#run-userid').addEventListener('input', () => {
   clearTimeout(refreshQuota._t)
   refreshQuota._t = setTimeout(refreshQuota, 350)
+})
+
+/* 方案 B：全部账号签到默认隐藏，点右上角 ⚙ 展开/收起。
+   刻意不记忆展开状态：管理员密码框不应在下次打开页面时自动出现。 */
+$('#btn-run-admin-toggle').addEventListener('click', () => {
+  const panel = $('#run-admin-panel')
+  const btn = $('#btn-run-admin-toggle')
+  const willShow = panel.hidden
+  panel.hidden = !willShow
+  btn.setAttribute('aria-pressed', willShow ? 'true' : 'false')
+  btn.classList.toggle('active', willShow)
+  if (willShow) {
+    $('#run-admin-key').focus()
+  } else {
+    // 收起时清空密码，避免停留在 DOM 中
+    $('#run-admin-key').value = ''
+  }
+})
+
+/* 账号搜索：按昵称或酷狗ID 过滤 */
+$('#accounts-search').addEventListener('input', ev => {
+  accountsSearch = ev.target.value
+  clearTimeout($('#accounts-search')._t)
+  $('#accounts-search')._t = setTimeout(renderAccountList, 120)
 })
 
 /* ────────────────── 启动 ────────────────── */

@@ -1092,8 +1092,9 @@ app.get('/api/accounts', wrap(async (req, res) => {
   res.json({
     accounts: visible.map(({ u, i }, vi) => ({
       index: i,
-      userid: maskIdentifier(u.userid),
-      // 完整 userid 仅用于前端发起按 id 的删除（面板本身已受独立密码保护）
+      // userid 完整返回：面板整体受独立密码保护，脱敏会妨碍用户核对与搜索自己的账号
+      userid: String(u.userid),
+      // 兼容字段：前端删除等操作按完整 id 进行
       rawUserid: String(u.userid),
       nickname: nicknames[vi],
       tokenLength: String(u.token || '').length,

@@ -121,6 +121,54 @@ function markManualCheckin(ip) {
   }
 }
 
+// ── 单账号签到的每日配额 ──
+// 按 userid 计数（不分 IP）：每天最多 CHECKIN_PER_USERID_DAILY 次。
+// 与上面的 IP 冷却相互独立，两者都作用于「单账号签到」；
+// admin 验证后的「全部账号签到」不占用该配额。
+const CHECKIN_PER_USERID_DAILY = (() => {
+  const raw = String(process.env.CHECKIN_PER_USERID_DAILY ?? '').trim()
+  if (raw === '') return 2
+  const n = parseInt(raw, 10)
+  return Number.isFinite(n) && n >= 0 ? n : 2
+})()
+// userid -> { date: 'YYYY-MM-DD', count: N, lastAt: ms }
+const perUseridUsage = new Map()
+const PER_USERID_MAP_MAX = 5000
+
+/** 北京时间日期字符串（与 main.js 的调度口径一致）。 */
+function beijingToday() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date())
+}
+
+/**
+ * 查询某 userid 今日已用次数。
+ * @param {string} userid
+ * @returns {{ used: number, limit: number, remaining: number }}
+ */
+function perUseridQuota(userid) {
+  const today = beijingToday()
+  const rec = perUseridUsage.get(String(userid))
+  const used = rec && rec.date === today ? rec.count : 0
+  return { used, limit: CHECKIN_PER_USERID_DAILY, remaining: Math.max(0, CHECKIN_PER_USERID_DAILY - used) }
+}
+
+/** 记录某 userid 的一次单账号签到（跨天自动归零）。 */
+function markPerUseridUsed(userid) {
+  if (CHECKIN_PER_USERID_DAILY <= 0) return
+  const today = beijingToday()
+  const key = String(userid)
+  const rec = perUseridUsage.get(key)
+  const count = rec && rec.date === today ? rec.count + 1 : 1
+  perUseridUsage.set(key, { date: today, count, lastAt: Date.now() })
+  if (perUseridUsage.size > PER_USERID_MAP_MAX) {
+    for (const [k, v] of perUseridUsage) {
+      if (v.date !== today) perUseridUsage.delete(k)
+    }
+  }
+}
+
 /** 把剩余毫秒格式化为「X 小时 Y 分钟」（中文提示用）。 */
 function formatRemaining(ms) {
   const totalMin = Math.max(1, Math.ceil(ms / 60000))
@@ -264,17 +312,35 @@ function broadcast(event, data) {
  * 子进程通过 API_PORT 使用独立端口拉起自己的 API 服务，与登录服务互不冲突；
  * 凭据优先取挂载卷文件内容，其次继承环境变量 USERINFO。
  */
-function startCheckin(trigger = 'manual') {
+function startCheckin(trigger = 'manual', options = {}) {
   if (checkinState.running) return false
+
+  // 单账号模式：仅把该账号的凭据传给子进程，实现"用 userid 执行对应账号的签到"
+  const onlyUserid = options.onlyUserid ? String(options.onlyUserid) : null
 
   checkinState.running = true
   const startedAt = new Date().toISOString()
-  checkinState.lastRun = { startedAt, trigger, running: true }
+  checkinState.lastRun = { startedAt, trigger, running: true, onlyUserid }
+  checkinState.currentOnlyUserid = onlyUserid
 
-  pushLog('sys', `────── 签到任务开始（${trigger === 'cron' ? '定时调度' : trigger === 'startup' ? '启动触发' : '手动触发'} · ${startedAt}）──────`)
+  const triggerLabel = trigger === 'cron' ? '定时调度'
+    : trigger === 'startup' ? '启动触发'
+    : onlyUserid ? `手动触发 · 账号 ${maskIdentifier(onlyUserid)}`
+    : '手动触发'
+  pushLog('sys', `────── 签到任务开始（${triggerLabel} · ${startedAt}）──────`)
   broadcast('start', checkinState.lastRun)
 
-  const userinfoRaw = readUserinfoRaw()
+  let userinfoRaw = readUserinfoRaw()
+  if (onlyUserid) {
+    // 只保留目标账号；从原始数组过滤，确保其它账号的 token 完全不进入子进程
+    try {
+      const arr = parseUserinfoJson(userinfoRaw) || []
+      const target = arr.filter(u => String(u.userid) === onlyUserid)
+      userinfoRaw = JSON.stringify(target)
+    } catch {
+      userinfoRaw = ''
+    }
+  }
 
   // 凭据通过 stdin 传给子进程，而不是放进环境变量：
   // 环境变量可被同容器/同主机的其他进程经 /proc/<pid>/environ 读取，等于把 token 暴露给任意进程。
@@ -318,6 +384,7 @@ function startCheckin(trigger = 'manual') {
   child.on('exit', code => {
     const exitCode = code ?? 1
     checkinState.running = false
+    checkinState.currentOnlyUserid = null
     checkinState.lastRun = {
       ...checkinState.lastRun,
       endedAt: new Date().toISOString(),
@@ -829,6 +896,10 @@ app.post('/api/phone/login', wrap(async (req, res) => {
 }))
 
 // ── 一键签到 ──
+// 两种模式：
+//   1) 单账号：请求体传 userid → 只签该账号，每个 userid 每天最多 N 次（默认 2）
+//   2) 全量：请求头带 admin 凭据（X-Accounts-Id / X-Accounts-Key）→ 签所有账号，
+//      不占单账号配额，仍沿用「今日已签到则跳过」机制
 app.post('/api/checkin/run', wrap(async (req, res) => {
   if (checkinState.running) {
     const err = new Error('签到任务正在进行中，请稍候')
@@ -842,9 +913,63 @@ app.post('/api/checkin/run', wrap(async (req, res) => {
     throw err
   }
 
-  // 手动触发的限流：同一 IP 每 12 小时仅一次（内网/本机豁免）。
-  // 放在凭据校验之后：未登录的请求仍返回 400，不会被误报为「已触发」。
   const ip = clientIp(req)
+  const rawUserid = req.body?.userid != null ? String(req.body.userid).trim() : ''
+
+  // ── 模式一：指定 userid，只签该账号 ──
+  if (rawUserid) {
+    const target = accounts.find(u => String(u.userid) === rawUserid)
+    if (!target) {
+      const err = new Error('该 userid 不在已配置的账号中，请先在「扫码登录」或「手机号登录」中添加')
+      err.status = 404
+      throw err
+    }
+
+    // ① 每 userid 每天 N 次（不分 IP，全局计数）
+    if (CHECKIN_PER_USERID_DAILY > 0) {
+      const q = perUseridQuota(rawUserid)
+      if (q.remaining <= 0) {
+        const err = new Error(
+          `账号 ${maskIdentifier(rawUserid)} 今日已手动签到 ${q.used} 次，达到上限（${q.limit} 次/天），请明日再试`
+        )
+        err.status = 429
+        err.code = 'per-userid-quota-exceeded'
+        throw err
+      }
+    }
+
+    // ② 公网来源仍受 IP 冷却约束，防止单人反复刷不同账号
+    if (!isPrivateIp(ip) && CHECKIN_MANUAL_COOLDOWN_MS > 0) {
+      const cd = manualCheckinCooldown(ip)
+      if (cd.blocked) {
+        const err = new Error(
+          `该 IP 已触发过签到，需等待 ${formatRemaining(cd.remainingMs)} 后才能再次手动触发`
+        )
+        err.status = 429
+        err.code = 'manual-checkin-cooldown'
+        err.retryAfterMs = cd.remainingMs
+        throw err
+      }
+    }
+
+    startCheckin('manual', { onlyUserid: rawUserid })
+    if (CHECKIN_PER_USERID_DAILY > 0) markPerUseridUsed(rawUserid)
+    if (!isPrivateIp(ip)) markManualCheckin(ip)
+    const q = perUseridQuota(rawUserid)
+    return res.status(202).json({ ok: true, mode: 'single', userid: maskIdentifier(rawUserid), remaining: q.remaining })
+  }
+
+  // ── 模式二：全部账号，必须通过 admin 验证 ──
+  const { id, key } = providedAccountsCreds(req)
+  const scope = id && key ? verifyAccountsCreds(id, key, req) : null
+  if (!scope || !scope.admin) {
+    const err = new Error('全部账号签到需要管理员（admin）账号与密码验证')
+    err.status = 401
+    err.code = 'admin-required'
+    throw err
+  }
+
+  // admin 全量签到不占单账号配额；仍受 IP 冷却约束，避免被反复触发拖垮接口
   if (!isPrivateIp(ip) && CHECKIN_MANUAL_COOLDOWN_MS > 0) {
     const cd = manualCheckinCooldown(ip)
     if (cd.blocked) {
@@ -859,9 +984,16 @@ app.post('/api/checkin/run', wrap(async (req, res) => {
   }
 
   startCheckin('manual')
-  // 仅在真正启动任务后记账，避免"启动了但立刻失败"之外的误伤
   if (!isPrivateIp(ip)) markManualCheckin(ip)
-  res.status(202).json({ ok: true })
+  res.status(202).json({ ok: true, mode: 'all' })
+}))
+
+/** 单账号签到的今日配额查询（前端展示"今日剩余次数"用） */
+app.get('/api/checkin/quota', wrap(async (req, res) => {
+  const userid = req.query.userid != null ? String(req.query.userid).trim() : ''
+  if (!userid) return res.json({ limit: CHECKIN_PER_USERID_DAILY, perUserid: true })
+  const q = perUseridQuota(userid)
+  res.json({ userid: maskIdentifier(userid), limit: q.limit, used: q.used, remaining: q.remaining })
 }))
 
 app.get('/api/checkin/logs', (req, res) => {

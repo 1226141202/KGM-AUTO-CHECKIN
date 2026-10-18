@@ -50,8 +50,10 @@ let ACCOUNTS_ID = sessionStorage.getItem('kc_accts_id') || ''
 async function api(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) }
   if (AUTH) headers['X-WebUI-Key'] = AUTH
-  if (ACCOUNTS_KEY) headers['X-Accounts-Key'] = ACCOUNTS_KEY
-  if (ACCOUNTS_ID) headers['X-Accounts-Id'] = ACCOUNTS_ID
+  // 显式传入的账号凭据优先：避免账号管理面板已解锁时的全局 ACCOUNTS_KEY
+  // 覆盖本次调用专门指定的 admin 密码（否则会用上一次的凭据去验全量签到）
+  if (!headers['X-Accounts-Key'] && ACCOUNTS_KEY) headers['X-Accounts-Key'] = ACCOUNTS_KEY
+  if (!headers['X-Accounts-Id'] && ACCOUNTS_ID) headers['X-Accounts-Id'] = ACCOUNTS_ID
   const res = await fetch(path, { ...opts, headers })
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
@@ -125,8 +127,14 @@ async function refreshStatus() {
 
   setChip('#chip-run', `▮ 签到: ${s.checkin.running ? '运行中' : s.checkin.lastRun ? (s.checkin.lastRun.ok ? '上次成功' : '上次失败') : '从未运行'}`,
     s.checkin.running ? 'warn' : s.checkin.lastRun ? (s.checkin.lastRun.ok ? 'ok' : 'err') : '')
-  $('#btn-run').disabled = s.checkin.running
-  $('#run-state').textContent = s.checkin.running
+  // 运行中时禁用两个签到按钮，避免重复触发
+  const running = s.checkin.running
+  const one = $('#btn-run-one')
+  const all = $('#btn-run-all')
+  if (one && !running) one.disabled = false
+  if (all && !running) all.disabled = false
+  if (running) { if (one) one.disabled = true; if (all) all.disabled = true }
+  $('#run-state').textContent = running
     ? '// 签到任务运行中…'
     : s.checkin.lastRun
       ? `// 上次运行：${s.checkin.lastRun.trigger === 'cron' ? '定时' : s.checkin.lastRun.trigger === 'startup' ? '启动' : '手动'} · 退出码 ${s.checkin.lastRun.exitCode}`
@@ -705,19 +713,87 @@ function connectSse() {
   }
 }
 
-$('#btn-run').addEventListener('click', async () => {
-  const btn = $('#btn-run')
+/** 单账号签到：按 userid 触发，受「每 userid 每天 2 次」配额约束 */
+$('#btn-run-one').addEventListener('click', async () => {
+  const btn = $('#btn-run-one')
+  const userid = $('#run-userid').value.trim()
+  if (!userid) {
+    toast('请先填写酷狗ID（userid）', 'err')
+    $('#run-userid').focus()
+    return
+  }
+  if (!/^\d+$/.test(userid)) {
+    toast('userid 应为纯数字', 'err')
+    $('#run-userid').focus()
+    return
+  }
   btn.disabled = true
   try {
-    await api('/api/checkin/run', { method: 'POST', body: '{}' })
+    const r = await api('/api/checkin/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userid }),
+    })
     $('#run-state').textContent = '// 签到任务已启动…'
-    toast('签到任务已启动', 'ok')
+    toast(`已启动该账号签到${typeof r?.remaining === 'number' ? `（今日剩余 ${r.remaining} 次）` : ''}`, 'ok')
     refreshStatus()
+    refreshQuota()
   } catch (e) {
     btn.disabled = false
     toast(e.message, 'err')
     refreshStatus()
   }
+})
+
+/** 全部账号签到：必须通过 admin 账号+密码验证 */
+$('#btn-run-all').addEventListener('click', async () => {
+  const btn = $('#btn-run-all')
+  const password = $('#run-admin-key').value
+  if (!password) {
+    toast('全部账号签到需要输入 admin 密码', 'err')
+    $('#run-admin-key').focus()
+    return
+  }
+  btn.disabled = true
+  try {
+    await api('/api/checkin/run', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Accounts-Id': 'admin',
+        'X-Accounts-Key': password,
+      },
+      body: '{}',
+    })
+    $('#run-state').textContent = '// 签到任务已启动…'
+    $('#run-admin-key').value = ''
+    toast('全部账号签到已启动', 'ok')
+    refreshStatus()
+  } catch (e) {
+    btn.disabled = false
+    toast(e.status === 401 ? 'admin 验证失败：账号或密码错误' : e.message, 'err')
+    refreshStatus()
+  }
+})
+
+/** 输入 userid 后自动查询今日剩余次数 */
+async function refreshQuota() {
+  const userid = $('#run-userid').value.trim()
+  const el = $('#run-one-quota')
+  if (!el) return
+  if (!userid || !/^\d+$/.test(userid)) { el.textContent = ''; return }
+  try {
+    const q = await api(`/api/checkin/quota?userid=${encodeURIComponent(userid)}`)
+    el.textContent = `// 今日已用 ${q.used}/${q.limit} 次，剩余 ${q.remaining} 次`
+    el.className = q.remaining > 0 ? 'dim' : 'dim warn'
+  } catch {
+    el.textContent = ''
+  }
+}
+
+$('#run-userid').addEventListener('input', () => {
+  clearTimeout(refreshQuota._t)
+  refreshQuota._t = setTimeout(refreshQuota, 350)
 })
 
 /* ────────────────── 启动 ────────────────── */

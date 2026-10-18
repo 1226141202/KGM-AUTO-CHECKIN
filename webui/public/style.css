@@ -178,6 +178,23 @@ main {
 
 .inline-label { color: var(--dim); font-size: 13px; }
 
+/* 签到页的两种模式分区：单账号 / 全部账号，用左侧竖线区分，避免误点 */
+.run-block {
+  border-left: 2px solid var(--border-light);
+  padding-left: 12px;
+  margin-bottom: 14px;
+}
+.run-block-head {
+  font-size: 13px;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.run-block .row { margin-bottom: 0; }
+.run-block .input { max-width: 240px; }
+
 .field { margin-bottom: 16px; }
 .field > label {
   display: block;

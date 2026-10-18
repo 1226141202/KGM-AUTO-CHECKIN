@@ -63,6 +63,9 @@ services:
       # 手动「立即签到」限流：同一 IP 每 N 小时仅可触发一次（内网/本机 IP 豁免）。
       # 默认 12 小时；设为 0 关闭该限制。
       CHECKIN_MANUAL_COOLDOWN_HOURS: ${CHECKIN_MANUAL_COOLDOWN_HOURS:-12}
+      # 单账号签到的每日配额：每个 userid 每天最多 N 次（不分 IP，按北京时间跨天重置）。
+      # 「全部账号签到」需 admin 验证，不占用该配额。默认 2 次。
+      CHECKIN_PER_USERID_DAILY: ${CHECKIN_PER_USERID_DAILY:-2}
       # ── 凭据（二选一）──
       # 方式一（推荐）：在 WebUI 里扫码/手机号登录，凭据自动保存到挂载卷 data/userinfo.json
       # 方式二：直接贴入已有的 USERINFO（与 GitHub Actions 的 Secret 格式一致）

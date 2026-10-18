@@ -285,6 +285,9 @@ function startCheckin(trigger = 'manual') {
   if (trigger === 'manual') {
     env.CHECKIN_SKIP_DONE = '1'
   }
+  // 让子进程把各账号的 VIP 到期时间写盘，供「账号管理」面板展示
+  // （日志里不再刷「VIP到期时间」，避免每账号 2 行噪音）
+  env.CHECKIN_STATUS_FILE = checkinStatusFile()
 
   const child = spawn(process.execPath, [path.join(ROOT, 'main.js')], {
     cwd: ROOT,
@@ -887,6 +890,26 @@ app.get('/api/checkin/logs', (req, res) => {
 
 // ── 账号管理（受 accountsGuard 保护：每账号独立密码，admin 可管理全部）──
 
+/** 签到状态文件路径：由 main.js 写入各账号的 VIP 到期时间，账号管理面板读取展示。 */
+function checkinStatusFile() {
+  const base = process.env.USERINFO_FILE
+    ? path.dirname(process.env.USERINFO_FILE)
+    : path.join(ROOT, 'data')
+  return path.join(base, 'checkin_status.json')
+}
+
+/** 读取签到状态文件中的 VIP 到期时间映射（userid -> 到期时间）。失败返回空对象。 */
+function readVipExpiries() {
+  try {
+    const text = fs.readFileSync(checkinStatusFile(), 'utf8').replace(/^\uFEFF/, '')
+    const parsed = JSON.parse(text)
+    const map = parsed?.vipExpiry
+    return map && typeof map === 'object' ? map : {}
+  } catch {
+    return {}
+  }
+}
+
 /** 验证身份凭据（解锁面板用）；失败计数与锁定由 accountsGuard 统一处理 */
 app.post('/api/accounts/unlock', wrap(async (req, res) => {
   res.json({ ok: true, admin: req.accountsScope.admin })
@@ -933,6 +956,7 @@ app.get('/api/accounts', wrap(async (req, res) => {
   const visible = scopeFilter(all, scope)
   const nicknames = await resolveAccountNicknames(visible.map(v => v.u))
   const auth = readAccountsAuth()
+  const vipExpiry = readVipExpiries()
   res.json({
     accounts: visible.map(({ u, i }, vi) => ({
       index: i,
@@ -943,6 +967,8 @@ app.get('/api/accounts', wrap(async (req, res) => {
       tokenLength: String(u.token || '').length,
       // 是否已自行设置过密码：false 表示当前仍在使用「酷狗ID」作为默认密码
       hasPassword: Boolean(auth[String(u.userid)]),
+      // VIP 到期时间：来自最近一次签到写的状态文件；尚未签到时为 null
+      vipExpiry: vipExpiry[String(u.userid)] || null,
     })),
     admin: scope.admin,
     lockEnabled: true,

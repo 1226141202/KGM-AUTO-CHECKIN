@@ -325,12 +325,20 @@ select.input { width: auto; min-width: 80px; }
 .term-body .line.err { color: var(--red); }
 .term-body .line .ts { color: #484f58; }
 
+/* 账号序号「[#4/28]」定宽显示：同一账号及不同账号的后续文字都从同一列开始。
+   用固定像素宽度而非 ch（ch 依赖字体实际字形宽度，在回退字体下会漂移）。
+   宽度按最长的「[#28/28]」估足，保证 1 位与 2 位序号不错列。 */
+.term-body .line .acct-tag {
+  display: inline-block;
+  min-width: 62px;
+  color: #6e7681;
+}
+
 /* 详细日志行：默认（简化模式）隐藏，切到 .term.verbose 时才显示。
    用 display 而非 visibility，避免隐藏行仍占用滚动高度。 */
 .term:not(.verbose) .term-body .line.muted-line { display: none; }
 
-/* 「已跳过」汇总行：简化模式下代替成批的跳过明细；详细模式下隐藏，
-   因为此时原始明细已逐行可见，再显示汇总是冗余。 */
+/* 折叠汇总行：灰色斜体，与「// 注释」风格一致，不抢眼。 */
 .term-body .line.skip-summary { color: var(--dim); font-style: italic; }
 .term.verbose .term-body .line.skip-summary { display: none; }
 

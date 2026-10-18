@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { printBlue, printGreen, printMagenta, printRed, printYellow } from "./utils/colorOut.js";
 import { hasSecretWriteToken, setRepoSecret } from "./utils/githubSecrets.js";
 import { maskDisplayName, maskIdentifier, sanitizeForLog, summarizeResponse } from "./utils/safeLog.js";
@@ -72,6 +74,8 @@ async function main() {
   const errorMsg = {}
   // 通知结果收集（并行完成后按账号原始顺序填充）
   const notifyResults = []
+  // userid -> VIP 到期时间（仅 WebUI 模式：设置 CHECKIN_STATUS_FILE 时收集并写盘）
+  const vipExpiries = {}
   let hasError = false
 
   // 单账号完整签到流程：并行时各账号独立执行，账号内部保持原有请求节奏（VIP 领取间隔 30s）
@@ -178,8 +182,11 @@ async function main() {
         const vip_details = await send(`/user/vip/detail?timestrap=${Date.now()}`, "GET", headers)
         if (vip_details.status === 1 && Array.isArray(vip_details.data?.busi_vip) && vip_details.data.busi_vip.length > 0) {
           vipExpiry = vip_details.data.busi_vip[0].vip_end_time
-          printBlue(`${tag} 今天是：${date}`)
-          printBlue(`${tag} VIP到期时间：${vipExpiry}\n`)
+          // 到期时间不再刷进实时日志（改在 WebUI「账号管理」查看，避免每账号 2 行刷屏），
+          // 但仍会写入通知内容与账号状态文件；WebUI 模式下通过 CHECKIN_STATUS_FILE 上报。
+          if (!process.env.CHECKIN_STATUS_FILE) {
+            printBlue(`${tag} VIP到期时间：${vipExpiry}\n`)
+          }
         } else {
           printRed(`${tag} 获取失败\n`)
           accountErrors[`${safeNickname} vip_details`] = summarizeResponse(vip_details)
@@ -199,6 +206,10 @@ async function main() {
         }
 
         // 通知中的领取次数：统一显示 "已领取 N 次"，仅在成功 8 次时展示总次数上限
+        // 顺带记录到期时间，供 WebUI「账号管理」展示（仅在有状态文件时收集）
+        if (process.env.CHECKIN_STATUS_FILE) {
+          vipExpiries[String(user.userid)] = vipExpiry
+        }
         return {
           nickname: safeNickname,
           status: listenStatus === '失败' || claimCount === 0 ? '部分失败' : '成功',
@@ -258,6 +269,25 @@ async function main() {
     hasError = Object.keys(errorMsg).some(k => !k.endsWith(' ad'))
   } finally {
     close_api(api)
+  }
+
+  // 把本轮查到的 VIP 到期时间写盘，供 WebUI「账号管理」展示。
+  // 仅在 WebUI 拉起签到子进程时设置 CHECKIN_STATUS_FILE；Actions/命令行不写。
+  const statusFile = process.env.CHECKIN_STATUS_FILE
+  if (statusFile && Object.keys(vipExpiries).length > 0) {
+    try {
+      const tmp = `${statusFile}.tmp`
+      fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify({ updatedAt: new Date().toISOString(), date, vipExpiry: vipExpiries }, null, 2),
+        'utf8'
+      )
+      fs.renameSync(tmp, statusFile)
+    } catch (e) {
+      // 写盘失败不影响签到结果，仅在详细模式下提示
+      printYellow(`警告：账号状态写入失败（${e.message}）`)
+    }
   }
 
   // 持久化当日已完成签到的账号（跨天自动失效），供手动触发时跳过

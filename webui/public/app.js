@@ -174,10 +174,15 @@ function renderAccounts(accounts, admin, mustChangePassword) {
     const noPwdHint = acct.hasPassword
       ? ''
       : '<div class="acct-sub warn">⚠ 仍在使用默认密码（酷狗ID），建议尽快修改</div>'
+    // VIP 到期时间：签到不再把到期时间刷进日志，统一在此展示
+    const vipHtml = acct.vipExpiry
+      ? `<div class="acct-sub">VIP 到期: <span class="vip-expiry">${escapeHtml(String(acct.vipExpiry))}</span></div>`
+      : '<div class="acct-sub dim">VIP 到期: 未获取（下次签到后显示）</div>'
     div.innerHTML = `
       <div class="acct-main">
         <div class="acct-id"><span class="idx">[${acct.index}]</span>${nameHtml}userid: ${acct.userid}</div>
         <div class="acct-sub">token: ****（${acct.tokenLength} 字符）· 每周日签到时自动刷新</div>
+        ${vipHtml}
         ${noPwdHint}
       </div>`
     const btn = document.createElement('button')
@@ -483,9 +488,14 @@ function isSkipLine(text) {
 /**
  * 判断一行日志是否属于「详细」级别（简化模式下隐藏）。
  *
- * 简化模式只保留：任务开始/结束、每个账号的关键节点（开始领取、成功/失败、
- * 今日已领取、次数用光）、VIP 到期、以及所有错误。
- * 隐藏的是高频且可推知的类型：逐次领取进度、等待提示、以及成批的「已跳过」行。
+ * 简化模式只保留：任务开始/结束、每个账号的结果（听歌成功/失败、今日已领取、
+ * 次数用光、领取失败）、错误、跳过汇总。
+ * 隐藏的是高频且可推知的类型：
+ *   - 领取流程的阶段性提示（「开始领取VIP...」「开始听歌领取VIP...」）
+ *   - 逐次领取进度（「第3次领取成功」）
+ *   - 等待提示
+ *   - 成批的「已跳过」行
+ *   - VIP 到期时间（改在「账号管理」面板查看）
  *
  * @param {string} text 去除 ANSI 后的纯文本
  * @returns {boolean} true = 详细日志（简化模式下隐藏）
@@ -493,13 +503,46 @@ function isSkipLine(text) {
 function isVerboseLine(text) {
   const t = String(text || '').trim()
   if (!t) return false
+  // 阶段开始提示：每个账号这两行必然出现，属过程噪音，结果行才是有效信息
+  if (/开始领取VIP\.{0,3}$/.test(t)) return true
+  if (/开始听歌领取VIP\.{0,3}$/.test(t)) return true
   // 逐次领取成功：「第3次领取成功」——保留最终统计即可，中间过程不显示
   if (/第\s*\d+\s*次领取成功/.test(t)) return true
   // 等待提示（8 次领取之间各等 30 秒）
   if (/等待\s*\d+\s*秒|请稍候/.test(t)) return true
   // 已跳过：账号多时成批刷屏，改用末尾汇总行代替
   if (isSkipLine(t)) return true
+  // 「今天是」与「VIP到期时间」：到期时间统一在「账号管理」查看，日志里不再重复
+  if (/今天是[：:]/.test(t)) return true
+  if (/VIP到期时间[：:]/.test(t)) return true
   return false
+}
+
+/**
+ * 从「[#4/28] 账号 xxx ...」这类日志中提取账号序号。
+ * 用于同一账号的多行日志在视觉上对齐（按序号分组着色/缩进）。
+ *
+ * @param {string} text
+ * @returns {string|null} 如 "4"，无序号时返回 null
+ */
+function accountKeyOf(text) {
+  const m = String(text || '').match(/\[#(\d+)\/\d+\]/)
+  return m ? m[1] : null
+}
+
+/**
+ * 把行首的「[#N/M]」包装为定宽元素，使后续文字从同一列开始。
+ * 必须在 ansiToHtml 之后调用，且只处理「行首、未被 span 包裹」的情形，
+ * 否则可能把已带颜色的片段拆坏。
+ *
+ * @param {string} html ansiToHtml 的输出
+ * @returns {string}
+ */
+function wrapAccountTag(html) {
+  // 仅匹配行首（可能前面有 <span class="ts">…</span> 之类），且标签内不含其他标签
+  return String(html).replace(/^((?:<span[^>]*>[\s\S]*?<\/span>\s*)*)(\[#(\d+)\/\d+\])/, (m, prefix, tag, num) => {
+    return `${prefix}<span class="acct-tag" data-acct="${num}">${tag}</span>`
+  })
 }
 
 /** 当前是否显示详细日志（默认简化） */
@@ -603,7 +646,10 @@ function appendLog(entry) {
   line.className = `line ${entry.level === 'log' ? '' : entry.level}`.trim()
   // 用纯文本判定详细级别（此时 text 尚未转 HTML，判定更可靠）
   if (isVerboseLine(entry.text)) line.classList.add('muted-line')
-  line.innerHTML = ts + ansiToHtml(entry.text)
+  // 同一账号的日志标同一序号，供 CSS 做对齐分组
+  const acct = accountKeyOf(entry.text)
+  if (acct) line.dataset.acct = acct
+  line.innerHTML = ts + wrapAccountTag(ansiToHtml(entry.text))
   const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 60
   // 仅移除「等待任务输出」这一条占位提示；空状态提示由 updateEmptyHint 统一管理
   const placeholder = body.querySelector('.dim')

@@ -1,18 +1,55 @@
+import fs from "node:fs";
+import path from "node:path";
 import { printBlue, printGreen, printMagenta, printRed, printYellow } from "./utils/colorOut.js";
 import { hasSecretWriteToken, setRepoSecret } from "./utils/githubSecrets.js";
 import { maskDisplayName, maskIdentifier, sanitizeForLog, summarizeResponse } from "./utils/safeLog.js";
 import { sendNotify } from "./utils/notify.js";
 import { close_api, delay, send, startService, waitForApi } from "./utils/utils.js";
+import { writeUserinfoFile, parseUserinfoJson } from "./utils/userinfo.js";
+import { beijingDateStr, isBeijingSunday } from "./utils/date.js";
+import { checkinStateEnabled, loadDoneToday, saveDoneToday } from "./utils/checkinState.js";
+
+/**
+ * 读取进程 stdin 的全部内容（用于从父进程安全接收凭据）。
+ * 环境变量可被同容器/同主机的其他进程通过 /proc/<pid>/environ 读取，
+ * 因此 WebUI 调用签到子进程时改用 stdin 传递凭据。
+ * @returns {Promise<string>} 去除首尾空白后的文本
+ */
+function readStdin() {
+  return new Promise(resolve => {
+    // 无 stdin（如 Actions/定时任务不设置该标记时不会走到这里）
+    if (!process.stdin || process.stdin.isTTY) return resolve('')
+    let data = ''
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('data', chunk => { data += chunk })
+    process.stdin.on('end', () => resolve(data.trim()))
+    process.stdin.on('error', () => resolve(data.trim()))
+  })
+}
+
+/**
+ * 获取 USERINFO 原始文本。优先级：
+ *   1. USERINFO 环境变量（GitHub Actions / Docker entrypoint 兼容路径）
+ *   2. USERINFO_STDIN=1 时从 stdin 读取（WebUI 子进程路径，避免凭据进入环境变量）
+ * @returns {Promise<string>}
+ */
+async function loadUserinfoRaw() {
+  const fromEnv = process.env.USERINFO
+  if (fromEnv && fromEnv.trim()) return fromEnv
+  if (['1', 'true', 'yes', 'on'].includes(String(process.env.USERINFO_STDIN || '').trim().toLowerCase())) {
+    return await readStdin()
+  }
+  return ''
+}
 
 async function main() {
 
-  const USERINFO = process.env.USERINFO
-  // 刷新token
+  const USERINFO = await loadUserinfoRaw()
   let needRefresh = false
-  if (!USERINFO) {
-    throw new Error("未配置")
+  const userinfo = parseUserinfoJson(USERINFO)
+  if (!userinfo) {
+    throw new Error("未配置或 USERINFO 格式错误（应为 [{\"userid\":\"...\",\"token\":\"...\"}]）")
   }
-  const userinfo = JSON.parse(USERINFO)
 
   // 启动服务并等待就绪（避免冷启动竞态导致首个请求失败）
   const api = startService()
@@ -23,56 +60,66 @@ async function main() {
     throw e
   }
 
-  const today = new Date();
-  // 服务器时间比国内慢8小时
-  today.setTime(today.getTime() + 8 * 60 * 60 * 1000)
-  //日期
-  const DD = String(today.getDate()).padStart(2, '0'); // 获取日
-  const MM = String(today.getMonth() + 1).padStart(2, '0'); //获取月份，1 月为 0
-  const yyyy = today.getFullYear(); // 获取年份
-  const date = yyyy + '-' + MM + '-' + DD
+  // 日期/星期统一按北京时间计算（与运行环境时区无关，兼容 UTC 的 Actions 与任意时区的 Docker/本地）
+  const now = new Date()
+  const date = beijingDateStr(now)
+
+  // 手动触发（WebUI「立即签到」/ scheduler.js once）时跳过当日已完成签到的账号；
+  // 定时任务与 GitHub Actions 不设置该标记，保持完整执行。
+  const skipDone = ['1', 'true', 'yes', 'on'].includes(String(process.env.CHECKIN_SKIP_DONE || '').trim().toLowerCase())
+  const stateEnabled = checkinStateEnabled(skipDone)
+  const doneSet = stateEnabled ? loadDoneToday(date) : new Set()
+  let skippedCount = 0
 
   const errorMsg = {}
-  // 通知结果收集
+  // 通知结果收集（并行完成后按账号原始顺序填充）
   const notifyResults = []
+  // userid -> VIP 到期时间（仅 WebUI 模式：设置 CHECKIN_STATUS_FILE 时收集并写盘）
+  const vipExpiries = {}
   let hasError = false
 
-  try {
-    // 开始签到
-    for (const user of userinfo) {
-      // 单账号异常隔离：任何一个账号的请求/解析出错，只记录该账号失败，
-      // 不影响其余账号继续执行，也保证后续通知与 secret 刷新一定能触发。
+  // 单账号完整签到流程：并行时各账号独立执行，账号内部保持原有请求节奏（VIP 领取间隔 30s）
+  async function processAccount(user, index) {
+    const tag = `[#${index + 1}/${userinfo.length}]`
+    const accountErrors = {} // 该账号的错误集（键名含账号标识，账号之间互不冲突，可安全并行写入）
+    try {
+      // 手动触发：当日已完成签到（无任何错误）的账号直接跳过，不再请求酷狗 API
+      if (skipDone && doneSet.has(String(user.userid))) {
+        const safeUserId = maskIdentifier(user.userid)
+        printYellow(`${tag} 账号 ${safeUserId} 今日已签到，跳过`)
+        skippedCount++
+        return {
+          nickname: safeUserId, status: '跳过', listen: '今日已签到',
+          vipClaim: '-', vipExpiry: '-', error: ''
+        }
+      }
+
+      // 单账号异常隔离：任何一个账号的请求/解析出错，只记录该账号失败，不影响其余账号继续执行
       try {
         let headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
         const userDetail = await send(`/user/detail?timestrap=${Date.now()}`, "GET", headers)
         if (userDetail?.data?.nickname == null) {
           const safeUserId = maskIdentifier(user.userid)
-          printRed(`token过期或账号不存在, userid: ${safeUserId}`)
-          errorMsg[safeUserId] = {
+          printRed(`${tag} token过期或账号不存在, userid: ${safeUserId}`)
+          accountErrors[safeUserId] = {
             msg: `token过期或账号不存在, userid: ${safeUserId}`,
             data: summarizeResponse(userDetail)
           }
-          notifyResults.push({
-            nickname: safeUserId,
-            status: '失败',
-            listen: '账号不存在',
-            vipClaim: '0/8',
-            vipExpiry: '未知',
-            error: 'token过期或账号不存在'
-          })
-          hasError = true
-          continue
+          return {
+            nickname: safeUserId, status: '失败', listen: '账号不存在',
+            vipClaim: '0/8', vipExpiry: '未知', error: 'token过期或账号不存在'
+          }
         }
         const safeNickname = maskDisplayName(userDetail.data.nickname)
-        printMagenta(`账号 ${safeNickname} 开始领取VIP...`)
+        printMagenta(`${tag} 账号 ${safeNickname} 开始领取VIP...`)
 
         // 周日刷新token
-        if (today.getDay() === 0) {
+        if (isBeijingSunday(now)) {
           const refreshToken = await send(`/login/token?timestrap=${Date.now()}`, "POST", headers)
           if (refreshToken?.status == 1) {
             if (refreshToken?.data?.token !== user.token) {
               needRefresh = true
-              printYellow(`账号 ${safeNickname} 需要刷新token`)
+              printYellow(`${tag} 账号 ${safeNickname} 需要刷新token`)
               user.token = refreshToken.data.token
               // 用新 token 重建本次请求的 headers，使后续听歌/VIP 领取使用刷新后的凭证
               headers = { 'cookie': 'token=' + user.token + '; userid=' + user.userid }
@@ -81,44 +128,52 @@ async function main() {
         }
 
         // 开始听歌
-        printYellow(`开始听歌领取VIP...`)
+        printYellow(`${tag} 开始听歌领取VIP...`)
         // 听歌获取vip
         const listen = await send(`/youth/listen/song?timestrap=${Date.now()}`, "GET", headers)
 
         let listenStatus = '未知'
+        // 听歌是否成功（含"今日已领取"）：决定该账号当日是否已被标记为完成
+        let listenOk = false
         if (listen.status === 1) {
-          printGreen("听歌领取成功")
+          printGreen(`${tag} 听歌领取成功`)
           listenStatus = '成功'
+          listenOk = true
         } else if (listen.error_code === 130012) {
-          printGreen("今日已领取")
+          printGreen(`${tag} 今日已领取`)
           listenStatus = '今日已领取'
+          listenOk = true
         } else {
-          errorMsg[`${safeNickname} listen`] = summarizeResponse(listen)
-          printRed("听歌领取失败")
+          accountErrors[`${safeNickname} listen`] = summarizeResponse(listen)
+          printRed(`${tag} 听歌领取失败`)
           listenStatus = '失败'
-          hasError = true
         }
 
-        printYellow("开始领取VIP...")
+        printYellow(`${tag} 开始领取VIP...`)
         let claimCount = 0
         let claimTotal = 0
+        // 领取阶段是否出现"非预期"失败：仅此类失败阻止当天标记完成。
+        // 次数用光（30002）属于正常终态，不算失败。
+        let claimFailed = false
         for (let i = 1; i <= 8; i++) {
-          // ad获取vip
           const ad = await send(`/youth/vip?timestrap=${Date.now()}`, "GET", headers)
           claimTotal = i
           if (ad.status === 1) {
-            printGreen(`第${i}次领取成功`)
+            printGreen(`${tag} 第${i}次领取成功`)
             claimCount++
             if (i != 8) {
               await delay(30 * 1000)
             }
           } else if (ad.error_code === 30002) {
-            printGreen("今天次数已用光")
+            printGreen(`${tag} 今天次数已用光`)
+            // 次数用光：把总次数记为已尝试次数，避免通知里出现 3/7 这类含混计数
+            claimTotal = claimCount
             break
           } else {
-            printRed(`第${i}次领取失败`)
-            errorMsg[`${safeNickname} ad`] = summarizeResponse(ad)
-            hasError = true
+            printRed(`${tag} 第${i}次领取失败`)
+            accountErrors[`${safeNickname} ad`] = summarizeResponse(ad)
+            claimFailed = true
+            claimTotal = claimCount
             break
           }
         }
@@ -127,48 +182,138 @@ async function main() {
         const vip_details = await send(`/user/vip/detail?timestrap=${Date.now()}`, "GET", headers)
         if (vip_details.status === 1 && Array.isArray(vip_details.data?.busi_vip) && vip_details.data.busi_vip.length > 0) {
           vipExpiry = vip_details.data.busi_vip[0].vip_end_time
-          printBlue(`今天是：${date}`)
-          printBlue(`VIP到期时间：${vipExpiry}\n`)
+          // 到期时间不再刷进实时日志（改在 WebUI「账号管理」查看，避免每账号 2 行刷屏），
+          // 但仍会写入通知内容与账号状态文件；WebUI 模式下通过 CHECKIN_STATUS_FILE 上报。
+          if (!process.env.CHECKIN_STATUS_FILE) {
+            printBlue(`${tag} VIP到期时间：${vipExpiry}\n`)
+          }
         } else {
-          printRed("获取失败\n")
-          errorMsg[`${safeNickname} vip_details`] = summarizeResponse(vip_details)
-          hasError = true
+          printRed(`${tag} 获取失败\n`)
+          accountErrors[`${safeNickname} vip_details`] = summarizeResponse(vip_details)
         }
 
-        notifyResults.push({
+        // 当日"已完成"的判定口径：
+        //   听歌成功（含今日已领取）即视为当日该做的已完成——后续 8 次领取广告位失败
+        //   多为酷狗侧限流/风控（如 20028），手动重跑也不会成功，只会重复请求并报错。
+        //   因此仅当「听歌本身失败」或「VIP 详情查询失败」时才不标记完成，保留重试机会。
+        // 注意：领取失败仍会写入 accountErrors 并出现在"异常信息如下"中，只是不再阻止跳过。
+        const vipDetailFailed = Boolean(accountErrors[`${safeNickname} vip_details`])
+        if (listenOk && !vipDetailFailed && stateEnabled) {
+          doneSet.add(String(user.userid))
+          if (claimFailed) {
+            printYellow(`${tag} 今日听歌已完成，领取失败不影响标记（手动触发将跳过该账号）`)
+          }
+        }
+
+        // 通知中的领取次数：统一显示 "已领取 N 次"，仅在成功 8 次时展示总次数上限
+        // 顺带记录到期时间，供 WebUI「账号管理」展示（仅在有状态文件时收集）
+        if (process.env.CHECKIN_STATUS_FILE) {
+          vipExpiries[String(user.userid)] = vipExpiry
+        }
+        return {
           nickname: safeNickname,
           status: listenStatus === '失败' || claimCount === 0 ? '部分失败' : '成功',
           listen: listenStatus,
-          vipClaim: `${claimCount}/${claimTotal}`,
+          vipClaim: claimTotal > 0 ? `${claimCount}/${claimTotal}` : `${claimCount}`,
           vipExpiry,
           error: ''
-        })
+        }
       } catch (err) {
         const safeUserId = maskIdentifier(user.userid || '未知')
-        printRed(`账号 ${safeUserId} 处理异常：${err && err.message ? err.message : String(err)}`)
-        errorMsg[safeUserId] = { msg: '处理异常', error: err && err.message ? err.message : String(err) }
-        notifyResults.push({
-          nickname: safeUserId,
-          status: '失败',
-          listen: '异常',
-          vipClaim: '0/8',
-          vipExpiry: '未知',
+        printRed(`${tag} 账号 ${safeUserId} 处理异常：${err && err.message ? err.message : String(err)}`)
+        accountErrors[safeUserId] = { msg: '处理异常', error: err && err.message ? err.message : String(err) }
+        return {
+          nickname: safeUserId, status: '失败', listen: '异常',
+          vipClaim: '0/8', vipExpiry: '未知',
           error: err && err.message ? err.message : String(err)
-        })
-        hasError = true
-        continue
+        }
       }
+    } finally {
+      // 各账号错误统一合并到全局（键名含账号标识互不冲突），保证"异常信息如下"输出与原有格式一致
+      Object.assign(errorMsg, accountErrors)
+    }
+  }
+
+  try {
+    // 并发数（账号级并行）：默认不限制——有几个账号就几路全部并行；
+    // CHECKIN_CONCURRENCY 可选限流：设 N = 最多 N 路，设 1 = 逐个串行（与旧版行为一致）
+    const rawConcurrency = String(process.env.CHECKIN_CONCURRENCY || '').trim().toLowerCase()
+    let CONCURRENCY
+    if (!rawConcurrency || rawConcurrency === 'max' || rawConcurrency === '0') {
+      CONCURRENCY = userinfo.length
+    } else {
+      const n = parseInt(rawConcurrency, 10)
+      CONCURRENCY = Math.min(Math.max(1, n || 1), Math.max(1, userinfo.length))
+    }
+    if (userinfo.length > 1) {
+      const source = (!rawConcurrency || rawConcurrency === 'max' || rawConcurrency === '0')
+        ? '全部账号同时并行'
+        : `限流 ${CONCURRENCY} 路（CHECKIN_CONCURRENCY，1 为逐个串行）`
+      printYellow(`多账号并行签到：${CONCURRENCY} 个账号同时进行（${source}）`)
     }
 
+    // 工作池：CONCURRENCY 个 worker 从队列取账号执行；results 始终按账号原始顺序排列
+    const results = new Array(userinfo.length)
+    let cursor = 0
+    const worker = async () => {
+      while (cursor < userinfo.length) {
+        const index = cursor++
+        results[index] = await processAccount(userinfo[index], index)
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, userinfo.length) }, worker))
+
+    notifyResults.push(...results)
+    // 仅「听歌/凭据/VIP详情」类错误算失败；广告位领取失败（键名以 " ad" 结尾）属降级告警：
+    // 该账号当日仍被标记完成、不会重跑，因此不应让整轮运行判定为异常。
+    hasError = Object.keys(errorMsg).some(k => !k.endsWith(' ad'))
   } finally {
     close_api(api)
   }
 
-  // 更新secret <USERINFO>（使用完整 userinfo 数组，保留所有用户包括过期账号）
+  // 把本轮查到的 VIP 到期时间写盘，供 WebUI「账号管理」展示。
+  // 仅在 WebUI 拉起签到子进程时设置 CHECKIN_STATUS_FILE；Actions/命令行不写。
+  const statusFile = process.env.CHECKIN_STATUS_FILE
+  if (statusFile && Object.keys(vipExpiries).length > 0) {
+    try {
+      const tmp = `${statusFile}.tmp`
+      fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify({ updatedAt: new Date().toISOString(), date, vipExpiry: vipExpiries }, null, 2),
+        'utf8'
+      )
+      fs.renameSync(tmp, statusFile)
+    } catch (e) {
+      // 写盘失败不影响签到结果，仅在详细模式下提示
+      printYellow(`警告：账号状态写入失败（${e.message}）`)
+    }
+  }
+
+  // 持久化当日已完成签到的账号（跨天自动失效），供手动触发时跳过
+  if (stateEnabled) {
+    if (saveDoneToday(date, doneSet)) {
+      printYellow(`今日已完成签到的账号已记录（${doneSet.size} 个），手动触发时将自动跳过`)
+    } else {
+      // 写盘失败不应中断签到，但必须显式告警：静默失败会让"手动触发跳过已签到"
+      // 悄悄失效（如 Actions 环境下无 USERINFO_FILE、默认 data 目录不可写）。
+      printYellow(`警告：当日签到状态写入失败（${doneSet.size} 个账号未记录），手动触发将不会跳过已签到账号`)
+    }
+  }
+
+  // 刷新后的凭据持久化：Docker 部署写入 USERINFO_FILE 文件（挂载卷），
+  // Actions 部署写入 GitHub Secret <USERINFO>（使用完整 userinfo 数组，保留所有用户包括过期账号）
   let secretError = null
   if (needRefresh) {
-    if (hasSecretWriteToken()) {
-      const userinfoJSON = JSON.stringify(userinfo)
+    const userinfoJSON = JSON.stringify(userinfo)
+    // 优先写本地凭据文件（Docker 模式），写失败时降级走 PAT
+    let savedToFile = false
+    if (process.env.USERINFO_FILE) {
+      savedToFile = writeUserinfoFile(userinfoJSON)
+    }
+    if (savedToFile) {
+      printGreen("USERINFO 文件 token 刷新成功")
+    } else if (hasSecretWriteToken()) {
       try {
         setRepoSecret("USERINFO", userinfoJSON)
         printGreen("secret <USERINFO> token刷新成功")
@@ -183,16 +328,40 @@ async function main() {
   }
 
   // 构建通知内容（放在 secret 更新之后、错误抛出之前，确保始终执行）
+  const skipCount = notifyResults.filter(r => r.status === '跳过').length
+  const allSkipped = skippedCount > 0 && skippedCount === notifyResults.length
+
+  // 手动触发且全部账号均已签到：不重复发送通知，避免冗余打扰
+  if (allSkipped) {
+    printGreen(`当日（${date}）所有账号均已签到，本次共跳过 ${skipCount} 个账号，无需发送通知`)
+    if (Object.keys(errorMsg).length > 0) {
+      printRed("异常信息如下:")
+      console.dir(sanitizeForLog(errorMsg), { depth: null })
+      // 只剩广告位失败时不视为异常（该账号当日已标记完成，重跑无意义）
+      if (Object.keys(errorMsg).some(k => !k.endsWith(' ad'))) {
+        throw new Error("领取异常")
+      }
+    }
+    if (secretError) {
+      throw secretError
+    }
+    return
+  }
+
   const title = `酷狗签到${hasError ? '异常' : '成功'} ${date}`
   let content = `📅 日期: ${date}\n`
   content += `📊 账号数: ${notifyResults.length}\n`
   const successCount = notifyResults.filter(r => r.status === '成功').length
-  const failCount = notifyResults.length - successCount
-  content += `✅ 成功: ${successCount}  ❌ 失败: ${failCount}\n`
+  const failCount = notifyResults.length - successCount - skipCount
+  content += `✅ 成功: ${successCount}  ⏭ 跳过: ${skipCount}  ❌ 失败: ${failCount}\n`
 
   for (const r of notifyResults) {
     content += `\n【${r.nickname}】\n`
     content += `  🎵 听歌领取: ${r.listen}\n`
+    if (r.status === '跳过') {
+      content += `  ⏭ 当日已完成签到，本次跳过\n`
+      continue
+    }
     content += `  🎁 VIP领取: ${r.vipClaim} 次\n`
     content += `  ⏰ VIP到期: ${r.vipExpiry}\n`
     if (r.error) {
@@ -210,7 +379,11 @@ async function main() {
   if (Object.keys(errorMsg).length > 0) {
     printRed("异常信息如下:")
     console.dir(sanitizeForLog(errorMsg), { depth: null })
-    throw new Error("领取异常")
+    // 仅广告位失败（已标记完成、次日才重试）不抛出，避免把正常完成误报为失败
+    if (Object.keys(errorMsg).some(k => !k.endsWith(' ad'))) {
+      throw new Error("领取异常")
+    }
+    printYellow("以上仅为领取广告位失败，账号当日已标记完成，次日再试")
   }
 
   if (secretError) {
@@ -219,4 +392,7 @@ async function main() {
 
 }
 
-main().then(() => process.exit(0)).catch(e => { console.error(e); process.exit(1) })
+// 以 exitCode 标记结果、等事件循环自然排空后退出：
+// 避免 Windows 下 process.exit() 与子进程 stdio 管道清理竞态触发 libuv 断言崩溃；
+// api 子进程已被 close_api 终止，管道关闭后进程会正常退出。
+main().then(() => { process.exitCode = 0 }).catch(e => { console.error(e); process.exitCode = 1 })

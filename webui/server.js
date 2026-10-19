@@ -21,6 +21,11 @@
  *   ACCOUNTS_LOCK_MINUTES 锁定时长（默认 5 分钟）
  *   WEBUI_API_PORT    登录用 API 服务端口（默认 3010）
  *   CHECKIN_API_PORT  签到子进程 API 服务端口（默认 3020）
+ *   WEBUI_PHONE_SEND_IP_LIMIT    发送验证码的 IP 限流，格式 "次数/分钟"（默认 "3/60"，即每 IP 每小时 3 次）
+ *   WEBUI_PHONE_SEND_PHONE_LIMIT 发送验证码的手机号限流，格式 "次数/分钟"（默认 "2/1440"，即每号 24 小时 2 次）
+ *   WEBUI_QR_GEN_IP_LIMIT        生成登录二维码的 IP 限流，格式 "次数/分钟"（默认 "1/3"，即每 IP 3 分钟 1 次）
+ *                     以上三项限流均对「内网/本机」来源豁免；反向代理部署必须正确设置 WEBUI_TRUST_PROXY，
+ *                     否则公网请求会被视为来自代理内网地址而全部豁免，限流形同虚设。
  *   CRON_SCHEDULE     签到计划任务（默认 "10 1 * * *"，每天北京时间 01:10）
  *   CRON_TIMEZONE     调度时区（默认 Asia/Shanghai）
  *   RUN_ON_STARTUP    "true" 时容器启动后立即执行一次签到
@@ -177,6 +182,106 @@ function formatRemaining(ms) {
   if (h > 0 && m > 0) return `${h} 小时 ${m} 分钟`
   if (h > 0) return `${h} 小时`
   return `${m} 分钟`
+}
+
+// ── 通用滑动窗口限流 ──
+// 保护会向酷狗发起真实请求、且可被公网匿名调用的接口（发送验证码 / 生成登录二维码）。
+// 采用时间戳数组的滑动窗口：窗口内计数达到上限即拒绝，并返回剩余等待时间。
+// 与上面的手动签到限流一致，内网/本机来源豁免（公网部署需正确设置 WEBUI_TRUST_PROXY）。
+
+/**
+ * 解析 "次数/分钟" 形式的限流配置，为空或非法时回落默认值。
+ * @param {string|undefined} raw
+ * @param {number} defCount
+ * @param {number} defMinutes
+ * @returns {{ count: number, windowMs: number }}
+ */
+function parseRateSpec(raw, defCount, defMinutes) {
+  const fallback = { count: defCount, windowMs: defMinutes * 60 * 1000 }
+  const s = String(raw ?? '').trim()
+  if (s === '') return fallback
+  const m = s.match(/^(\d+)\s*\/\s*(\d+(?:\.\d+)?)$/)
+  if (!m) return fallback
+  const count = parseInt(m[1], 10)
+  const minutes = parseFloat(m[2])
+  if (!Number.isFinite(count) || !Number.isFinite(minutes)) return fallback
+  return { count, windowMs: minutes * 60 * 1000 }
+}
+
+const PHONE_SEND_IP_LIMIT = parseRateSpec(process.env.WEBUI_PHONE_SEND_IP_LIMIT, 3, 60)
+const PHONE_SEND_PHONE_LIMIT = parseRateSpec(process.env.WEBUI_PHONE_SEND_PHONE_LIMIT, 2, 24 * 60)
+const QR_GEN_IP_LIMIT = parseRateSpec(process.env.WEBUI_QR_GEN_IP_LIMIT, 1, 3)
+
+// key -> 窗口内命中时间戳数组（递增）。桶数超过 RATE_MAP_MAX 时清理过期桶，避免内存无限增长。
+const rateBuckets = new Map()
+const RATE_MAP_MAX = 5000
+
+/** 取桶并丢弃窗口外的旧时间戳。 */
+function rateBucket(key, windowMs) {
+  const now = Date.now()
+  const cutoff = now - windowMs
+  let hits = rateBuckets.get(key)
+  if (!hits) {
+    hits = []
+    rateBuckets.set(key, hits)
+  }
+  while (hits.length && hits[0] <= cutoff) hits.shift()
+  if (rateBuckets.size > RATE_MAP_MAX) {
+    for (const [k, v] of rateBuckets) {
+      if (!v.length || v[v.length - 1] <= cutoff) rateBuckets.delete(k)
+    }
+  }
+  return hits
+}
+
+/**
+ * 检查并记录一次访问。
+ * @param {string} key 桶标识（含维度前缀，如 `sms:ip:1.2.3.4`）
+ * @param {{ count: number, windowMs: number }} spec
+ * @returns {{ allowed: boolean, retryAfterMs: number }}
+ */
+function rateLimitHit(key, spec) {
+  if (!spec || spec.count <= 0 || spec.windowMs <= 0) return { allowed: true, retryAfterMs: 0 }
+  const hits = rateBucket(key, spec.windowMs)
+  if (hits.length >= spec.count) {
+    return { allowed: false, retryAfterMs: Math.max(0, hits[0] + spec.windowMs - Date.now()) }
+  }
+  hits.push(Date.now())
+  return { allowed: true, retryAfterMs: 0 }
+}
+
+/** 剩余秒数的人类可读形式。 */
+function formatWait(secs) {
+  if (secs >= 3600) {
+    const h = Math.floor(secs / 3600)
+    const m = Math.ceil((secs % 3600) / 60)
+    return m > 0 ? `${h} 小时 ${m} 分钟` : `${h} 小时`
+  }
+  if (secs >= 60) return `${Math.ceil(secs / 60)} 分钟`
+  return `${secs} 秒`
+}
+
+/** 限流规格的可读描述（启动横幅用）。 */
+function describeRateLimit(spec) {
+  if (!spec || spec.count <= 0 || spec.windowMs <= 0) return '已关闭'
+  return `每 ${formatWait(Math.round(spec.windowMs / 1000))} ${spec.count} 次`
+}
+
+/**
+ * 超过限流时抛出 429（错误中间件会附带 Retry-After 头与响应体 retryAfter 字段）。
+ * @param {string} key
+ * @param {{ count: number, windowMs: number }} spec
+ * @param {string} label 提示语主语，如「验证码发送」
+ */
+function enforceRateLimit(key, spec, label) {
+  const r = rateLimitHit(key, spec)
+  if (r.allowed) return
+  const secs = Math.max(1, Math.ceil(r.retryAfterMs / 1000))
+  const err = new Error(`${label}过于频繁，请 ${formatWait(secs)}后再试`)
+  err.status = 429
+  err.code = 'rate-limited'
+  err.retryAfterMs = r.retryAfterMs
+  throw err
 }
 
 // 本进程内 utils（startService/send/waitForApi）统一使用登录专用端口
@@ -790,6 +895,10 @@ app.get('/api/status', wrap(async (req, res) => {
 
 // ── 扫码登录 ──
 app.post('/api/qr/gen', wrap(async (req, res) => {
+  // 每次生成都会向酷狗申请新的登录 key，按 IP 限流（内网/本机豁免）
+  const qrIp = normalizeIp(clientIp(req))
+  if (!isPrivateIp(qrIp)) enforceRateLimit(`qr:${qrIp}`, QR_GEN_IP_LIMIT, '二维码生成')
+
   const number = Math.min(5, Math.max(1, parseInt(req.body?.number, 10) || 1))
   const items = []
   await withApi(async () => {
@@ -855,6 +964,12 @@ function describeUpstreamError(r) {
 app.post('/api/phone/send', wrap(async (req, res) => {
   const phone = String(req.body?.phone || '').trim()
   assertPhone(phone)
+  // 双重限流：IP 维度防止换号刷量，手机号维度防止针对某一号码轰炸（内网/本机豁免）
+  const smsIp = normalizeIp(clientIp(req))
+  if (!isPrivateIp(smsIp)) {
+    enforceRateLimit(`sms:ip:${smsIp}`, PHONE_SEND_IP_LIMIT, '验证码发送')
+    enforceRateLimit(`sms:phone:${phone}`, PHONE_SEND_PHONE_LIMIT, '该手机号的验证码发送')
+  }
   const r = await withApi(() => send(`/captcha/sent?mobile=${phone}`, 'GET', {}))
   if (r?.status !== 1) {
     const err = new Error(`验证码发送失败：${describeUpstreamError(r)}`)
@@ -1216,7 +1331,12 @@ app.use((err, req, res, next) => {
   if (err.retryAfterMs > 0) {
     res.set('Retry-After', String(Math.ceil(err.retryAfterMs / 1000)))
   }
-  res.status(status).json({ error: err.message })
+  // 限流错误在响应体里也带上 retryAfter（秒），前端据此禁用按钮并倒计时
+  res.status(status).json({
+    error: err.message,
+    ...(err.code ? { code: err.code } : {}),
+    ...(err.retryAfterMs > 0 ? { retryAfter: Math.ceil(err.retryAfterMs / 1000) } : {}),
+  })
 })
 
 // ────────────────────────── 启动 ──────────────────────────
@@ -1249,7 +1369,13 @@ app.listen(WEBUI_PORT, () => {
   }
   if (WEBUI_TRUST_PROXY) {
     printYellow(`  反向代理: 已信任 X-Forwarded-For（WEBUI_TRUST_PROXY=${WEBUI_TRUST_PROXY}）`)
+  } else {
+    // 未信任代理头时，公网请求会被视为来自代理内网地址，所有按 IP 的限制（含账号防爆破）都会被豁免
+    printRed('  ⚠ 未设置 WEBUI_TRUST_PROXY：经反向代理的公网请求会全部被视为内网来源，')
+    printRed('    按 IP 的限流与账号防爆破计数将被豁免；公网部署请设为 1。')
   }
+  printYellow(`  验证码限流: IP ${describeRateLimit(PHONE_SEND_IP_LIMIT)} · 手机号 ${describeRateLimit(PHONE_SEND_PHONE_LIMIT)}（内网/本机豁免）`)
+  printYellow(`  二维码限流: IP ${describeRateLimit(QR_GEN_IP_LIMIT)}（内网/本机豁免）`)
   if (CHECKIN_MANUAL_COOLDOWN_MS > 0) {
     printYellow(`  手动签到限流: 同一 IP 每 ${CHECKIN_MANUAL_COOLDOWN_HOURS} 小时仅可触发一次（内网/本机豁免）`)
   } else {

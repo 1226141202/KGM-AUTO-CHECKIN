@@ -80,6 +80,30 @@ function toast(msg, type = '') {
   toastTimer = setTimeout(() => { el.className = 'toast' }, 4000)
 }
 
+/** 按钮冷却倒计时：禁用并在按钮上显示剩余时间（用于验证码 / 二维码的服务端限流） */
+function cooldownButton(btn, seconds, idleLabel) {
+  const total = Math.max(1, Math.ceil(Number(seconds) || 0))
+  clearInterval(btn._coolTimer)
+  btn.disabled = true
+  let left = total
+  const render = () => {
+    if (left <= 0) {
+      clearInterval(btn._coolTimer)
+      btn.disabled = false
+      btn.textContent = idleLabel
+      return
+    }
+    const mm = Math.floor(left / 60)
+    const ss = left % 60
+    btn.textContent = mm > 0
+      ? `[ 冷却中(${mm}:${String(ss).padStart(2, '0')}) ]`
+      : `[ 冷却中(${left}s) ]`
+    left--
+  }
+  render()
+  btn._coolTimer = setInterval(render, 1000)
+}
+
 /* ────────────────── 标签页 ────────────────── */
 
 $$('.tab').forEach(tab => {
@@ -400,6 +424,7 @@ $('#btn-qr-gen').addEventListener('click', async () => {
   const number = parseInt($('#qr-count').value, 10) || 1
   btn.disabled = true
   $('#qr-hint').textContent = '// 正在生成…'
+  let cooling = false
   try {
     const { items } = await api('/api/qr/gen', { method: 'POST', body: JSON.stringify({ number }) })
     const list = $('#qr-list')
@@ -419,9 +444,16 @@ $('#btn-qr-gen').addEventListener('click', async () => {
     toast('二维码已生成，请扫码', 'ok')
   } catch (e) {
     $('#qr-hint').textContent = ''
-    toast(e.message, 'err')
+    if (e.status === 429 && e.data && e.data.retryAfter) {
+      // 服务端限流：按真实剩余时间冷却，不再由 finally 重新启用按钮
+      cooling = true
+      $('#qr-hint').textContent = `// ${e.message}`
+      cooldownButton(btn, e.data.retryAfter, '[ 生成二维码 ]')
+    } else {
+      toast(e.message, 'err')
+    }
   } finally {
-    btn.disabled = false
+    if (!cooling) btn.disabled = false
   }
 })
 
@@ -477,16 +509,15 @@ $('#btn-send-code').addEventListener('click', async () => {
   try {
     await api('/api/phone/send', { method: 'POST', body: JSON.stringify({ phone }) })
     toast('验证码已发送，请查收短信', 'ok')
-    let left = 60
-    btn.textContent = `[ 重新发送(${left}s) ]`
-    const timer = setInterval(() => {
-      left--
-      if (left <= 0) { clearInterval(timer); btn.textContent = '[ 发送验证码 ]'; btn.disabled = false }
-      else btn.textContent = `[ 重新发送(${left}s) ]`
-    }, 1000)
+    cooldownButton(btn, 60, '[ 发送验证码 ]')
   } catch (e) {
-    btn.disabled = false
     toast(e.message, 'err')
+    if (e.status === 429 && e.data && e.data.retryAfter) {
+      // 服务端限流：按真实剩余时间冷却，避免反复点击徒增无效请求
+      cooldownButton(btn, e.data.retryAfter, '[ 发送验证码 ]')
+    } else {
+      btn.disabled = false
+    }
   }
 })
 

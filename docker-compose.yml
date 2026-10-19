@@ -33,8 +33,10 @@ services:
       # ── WebUI ──
       WEBUI_PORT: "3000"
       WEBUI_PASSWORD: ${WEBUI_PASSWORD:-}   # 可选访问密码，在 .env 中设置；公网暴露时强烈建议启用
-      # 部署在 Nginx/Caddy 等反向代理之后时设为 1，以信任 X-Forwarded-For 取真实客户端 IP。
+      # 部署在 Nginx/Caddy/Cloudflare Tunnel 等反向代理之后时必须设为 1，以信任 X-Forwarded-For 取真实客户端 IP。
       # 未设置则不信任该头（防止伪造 IP 绕过防爆破计数）；仅直连时无需设置。
+      # ⚠ 公网部署若忘了设置，所有外部请求都会被当成代理内网地址，
+      #    按 IP 的限流与账号防爆破计数将全部被豁免（启动横幅会红字提醒）。
       WEBUI_TRUST_PROXY: ${WEBUI_TRUST_PROXY:-}
       # ── 账号管理 ──
       # admin 管理员密码。未修改过密码的普通账号，其默认密码即酷狗ID。
@@ -48,6 +50,14 @@ services:
       # 设为 true 关闭「默认密码 = 酷狗ID」；此后未设密码的账号须由 admin 先设置密码。
       # 公网暴露时建议设为 true（酷狗ID 对他人可见，知道 ID 即可登录并改密）。
       ACCOUNTS_DISABLE_ID_DEFAULT: ${ACCOUNTS_DISABLE_ID_DEFAULT:-}
+      # ── 公网接口限流（防止匿名刷接口：发送短信验证码 / 生成登录二维码）──
+      # 格式均为 "次数/分钟"；留空使用默认值；设为 "0/1" 可关闭该项。
+      # 内网 / 本机 IP 自动豁免；反向代理部署必须正确设置 WEBUI_TRUST_PROXY，否则限流形同虚设。
+      # 发送验证码：默认每 IP 每小时 3 次、每手机号 24 小时 2 次（防止被用作短信轰炸机）。
+      WEBUI_PHONE_SEND_IP_LIMIT: ${WEBUI_PHONE_SEND_IP_LIMIT:-}
+      WEBUI_PHONE_SEND_PHONE_LIMIT: ${WEBUI_PHONE_SEND_PHONE_LIMIT:-}
+      # 生成登录二维码：默认每 IP 每 3 分钟 1 次（每次都会向酷狗申请新的登录 key）。
+      WEBUI_QR_GEN_IP_LIMIT: ${WEBUI_QR_GEN_IP_LIMIT:-}
       # ── 酷狗设备标识（建议固定：频繁更换设备会被风控静默丢弃验证码短信；在 .env 中设置）──
       KUGOU_API_GUID: ${KUGOU_API_GUID:-}
       KUGOU_API_MID: ${KUGOU_API_MID:-}
